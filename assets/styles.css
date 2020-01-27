@@ -48,6 +48,7 @@ strong {
 
     h1 {
         font-size: 65%;
+        max-width: 100%;
      }
     .preview_container {
         flex-direction: column;
