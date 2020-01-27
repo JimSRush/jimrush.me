@@ -118,4 +118,12 @@ strong {
     figure {
         margin: 0
     }
+
+    .figure {
+        width: 100%;
+    }
+    .image_content {
+        width: 100%;
+    }
+
 }
