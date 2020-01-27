@@ -63,4 +63,17 @@ strong {
 @media only screen and (min-width: 961px) {}
 
 /* Mobile Styles */
-@media only screen and (max-width: 400px) {}
+@media only screen and (max-width: 400px) {
+    .preview_container {
+        flex-direction: column;
+    }
+
+    .preview_image {
+        max-width: 100%;
+        width: 100%;
+    }
+
+    figure {
+        margin: 0
+    }
+}
