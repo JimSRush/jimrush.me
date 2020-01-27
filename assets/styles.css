@@ -67,7 +67,7 @@ strong {
 @media only screen and (min-width: 401px) and (max-width: 960px) {
 
     .grid {
-        display:block;
+        display: block;
     }
 
     h1 {
@@ -87,9 +87,11 @@ strong {
     figure {
         margin: 0;
     }
+
     .figure {
         width: 100%;
     }
+
     .image_content {
         width: 100%;
     }
@@ -101,9 +103,14 @@ strong {
 
 /* Mobile Styles */
 @media only screen and (max-width: 400px) {
+
     h1 {
         font-size: 48px;
         max-width: 100%;
+    }
+
+    .grid {
+        display: block;
     }
 
     .preview_container {
@@ -122,8 +129,8 @@ strong {
     .figure {
         width: 100%;
     }
+
     .image_content {
         width: 100%;
     }
-
 }
