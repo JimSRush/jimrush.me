@@ -16,6 +16,7 @@ ul {
 
 figcaption {
     font-size: 16px;
+    color: grey;
 }
 
 strong {
@@ -103,6 +104,10 @@ strong {
 
 /* Mobile Styles */
 @media only screen and (max-width: 400px) {
+
+    body {
+        text-align: left;
+    }
 
     h1 {
         font-size: 48px;
