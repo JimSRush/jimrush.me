@@ -9,6 +9,10 @@ h1 {
     font-size: 76px;
 }
 
+ul {
+    text-align: center;
+}
+
 figcaption {
     font-size: 16px;
 }
@@ -38,28 +42,25 @@ strong {
     padding: 8px;
 }
 
-
-
 /* Tablet Styles */
 @media only screen and (min-width: 401px) and (max-width: 960px) {
-    body {
-        background-color: #F5CF8E;
-        /* Yellow */
+    .preview_container {
+        flex-direction: column;
     }
+
+    .preview_image {
+        max-width: 100%;
+        width: 100%;
+    }
+
+    figure {
+        margin: 0
+    }
+
 }
 
 /* Desktop Styles */
-@media only screen and (min-width: 961px) {
-    body {
-        background-color: #B2D6FF;
-        /* Blue */
-    }
-}
+@media only screen and (min-width: 961px) {}
 
 /* Mobile Styles */
-@media only screen and (max-width: 400px) {
-    body {
-        background-color: red;
-        /* Red */
-    }
-}
+@media only screen and (max-width: 400px) {}
