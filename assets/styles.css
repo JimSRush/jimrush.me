@@ -66,6 +66,10 @@ strong {
 /* Tablet Styles */
 @media only screen and (min-width: 401px) and (max-width: 960px) {
 
+    .grid {
+        display:block;
+    }
+
     h1 {
         font-size: 48px;
         max-width: 100%;
@@ -81,7 +85,13 @@ strong {
     }
 
     figure {
-        margin: 0
+        margin: 0;
+    }
+    .figure {
+        width: 100%;
+    }
+    .image_content {
+        width: 100%;
     }
 
 }
