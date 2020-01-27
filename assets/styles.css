@@ -26,17 +26,37 @@ strong {
     background-color: rgb(251, 247, 240);
 }
 
+.grid {
+    margin: 0;
+    max-width: 100%;
+    display: grid;
+    grid-template-columns: repeat(16, 1fr);
+}
+
+.grid_item {
+    grid-column-start: 4;
+    grid-column-end: 14;
+}
+
 .preview_container {
     display: flex;
     justify-content: center;
 }
 
+.figure {
+    width: 50%;
+}
+
+.figure_image {
+    width: 50%;
+}
+
 .preview_image {
-    max-width: 300px;
+    width: 100%;
 }
 
 .image_content {
-    max-width: 300px;
+    width: 50%;
 }
 
 .padding_sm {
