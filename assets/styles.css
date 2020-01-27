@@ -1,11 +1,46 @@
 body {
-  font-family: "Roboto", sans-serif;
+    font-family: "Roboto", sans-serif;
+    font-size: 24px;
+    text-align: center;
+    color:rgb(29, 45, 53);
+}
+
+h1 {
+    font-size: 76px;
+}
+
+figcaption {
+    font-size: 16px;
 }
 
 strong {
-  font-weight: bold;
+    font-weight: bold;
+}
+
+.preview_container {
+    display: flex;
+    justify-content: center;
 }
 
 .preview_image {
     max-width: 300px;
 }
+
+.image_content {
+    max-width: 300px;
+}
+
+.list_container {
+    display: flex;
+    justify-content: center;
+    flex-direction: column;
+}
+
+.margin_l_20 {
+    margin-left: 20%;
+}
+
+.margin_l_20 {
+    margin-right: 20%
+}
+
