@@ -962,7 +962,7 @@ The raw DirectoryServices.SearchResult object, if -Raw is enabled.
                 $Filter += '(msds-allowedtodelegateto=*)'
             }
             if ($PSBoundParameters['PreauthNotRequired']) {
-                Write-Verbose '[Get-DomainUser] Searching for user accounts that do not require kerberos preauthenticate'
+                Write-Verbose '[Get-DomainUser] Searchiang for user accounts that do not require kerberos preauthenticate'
                 $Filter += '(userAccountControl:1.2.840.113556.1.4.803:=4194304)'
             }
             if ($PSBoundParameters['LDAPFilter']) {
