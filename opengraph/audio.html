@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en" prefix="og: https://ogp.me/ns#
+                           fb: https://ogp.me/ns/fb#
+                           article: https://ogp.me/ns/article#
+                           book: https://ogp.me/ns/book#
+                           profile: https://ogp.me/ns/profile#
+                           video: https://ogp.me/ns/video#
+                           music: https://ogp.me/ns/music#">
+<head>
+  <meta charset="UTF-8">
+  <title>Full OpenGraph Tag Reference</title>
+
+  <!-- ============================================================
+       BASIC METADATA (required by the OGP spec)
+       ============================================================ -->
+  <meta property="og:title"       content="audio only" />
+  
+
+  <!-- ============================================================
+       AUDIO (structured)
+       ============================================================ -->
+  <meta property="og:audio"            content="https://479l88doheklg30cqe3zcsqzoquhi9jx8.oastify.com/audio/track.mp3" />
+  <meta property="og:audio:url"        content="https://479l88doheklg30cqe3zcsqzoquhi9jx8.oastify.com/audio/track.mp3" />
+  <meta property="og:audio:secure_url" content="https://479l88doheklg30cqe3zcsqzoquhi9jx8.oastify.com/audio/track.mp3" />
+  <meta property="og:audio:type"       content="audio/mpeg" />
+
+  <!-- ============================================================
+       TYPE-SPECIFIC: article
+       og:type must be "article" for these to apply.
+       ============================================================ -->
+  <!-- <meta property="og:type" content="article" /> -->
+
+
+  <!-- ============================================================
+       ADDITIONAL / EXTENDED TAGS USED BY CRAWLERS IN THE WILD
+       ============================================================ -->
+  <!-- Pinterest -->
+  <meta name="pinterest:media"    content="https://479l88doheklg30cqe3zcsqzoquhi9jx8.oastify.com/images/pin.jpg" />
+  <meta name="pinterest-rich-pin" content="true" />
+
+  <!-- LinkedIn (re-uses og: tags, but these are sometimes parsed) -->
+  <meta property="og:updated_time" content="2024-06-15T12:00:00+00:00" />
+
+  <!-- Slack / messaging unfurls sometimes read these -->
+  <meta name="description" content="Fallback meta description for clients that do not read og:description." />
+
+  <style>
+    body { font-family: monospace; max-width: 900px; margin: 2rem auto; padding: 1rem; background:#0d1117; color:#c9d1d9; line-height:1.6; }
+    h1   { color:#58a6ff; }
+    h2   { color:#79c0ff; border-bottom:1px solid #30363d; padding-bottom:.3rem; margin-top:2rem; }
+    code { background:#161b22; padding:.15rem .4rem; border-radius:4px; font-size:.9em; }
+    table{ width:100%; border-collapse:collapse; margin:.5rem 0 1.5rem; font-size:.85em; }
+    th   { background:#161b22; color:#8b949e; text-align:left; padding:.4rem .6rem; }
+    td   { padding:.35rem .6rem; border-bottom:1px solid #21262d; vertical-align:top; }
+    tr:hover td { background:#161b22; }
+    .tag { color:#ff7b72; }
+    .val { color:#a5d6ff; }
+    .ns  { color:#d2a8ff; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Full OpenGraph Tag Reference</h1>
+  <p>Every <code>og:</code>, type-specific, Facebook, Twitter Card, and extended meta tag is present in the <code>&lt;head&gt;</code> of this document. Use <kbd>View Source</kbd> to inspect them directly.</p>
+
+  <h2>Core OGP Tags</h2>
+  <table>
+    <tr><th>Property</th><th>Description</th><th>Required?</th></tr>
+    <tr><td class="tag">og:title</td><td>Title of the object</td><td>✅ Yes</td></tr>
+    <tr><td class="tag">og:type</td><td>Object type (website, article, book, profile, music.*, video.*)</td><td>✅ Yes</td></tr>
+    <tr><td class="tag">og:url</td><td>Canonical URL of the object</td><td>✅ Yes</td></tr>
+    <tr><td class="tag">og:image</td><td>Image URL representing the object</td><td>✅ Yes</td></tr>
+    <tr><td class="tag">og:description</td><td>1–2 sentence description</td><td>Optional</td></tr>
+    <tr><td class="tag">og:determiner</td><td>Word before the title in a sentence: a / an / the / "" / auto</td><td>Optional</td></tr>
+    <tr><td class="tag">og:locale</td><td>Content locale (e.g. en_US)</td><td>Optional</td></tr>
+    <tr><td class="tag">og:locale:alternate</td><td>Alternate locales available (repeatable)</td><td>Optional</td></tr>
+    <tr><td class="tag">og:site_name</td><td>Name of the overall website</td><td>Optional</td></tr>
+  </table>
+
+  <h2>Image Sub-Properties</h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">og:image:url</td><td>Same as og:image</td></tr>
+    <tr><td class="tag">og:image:secure_url</td><td>HTTPS version of the image URL</td></tr>
+    <tr><td class="tag">og:image:type</td><td>MIME type of the image (e.g. image/png)</td></tr>
+    <tr><td class="tag">og:image:width</td><td>Width in pixels</td></tr>
+    <tr><td class="tag">og:image:height</td><td>Height in pixels</td></tr>
+    <tr><td class="tag">og:image:alt</td><td>Alt text description</td></tr>
+  </table>
+
+  <h2>Video Sub-Properties</h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">og:video</td><td>URL to a video file</td></tr>
+    <tr><td class="tag">og:video:url</td><td>Same as og:video</td></tr>
+    <tr><td class="tag">og:video:secure_url</td><td>HTTPS version</td></tr>
+    <tr><td class="tag">og:video:type</td><td>MIME type (e.g. video/mp4)</td></tr>
+    <tr><td class="tag">og:video:width</td><td>Width in pixels</td></tr>
+    <tr><td class="tag">og:video:height</td><td>Height in pixels</td></tr>
+    <tr><td class="tag">og:video:alt</td><td>Alt text</td></tr>
+  </table>
+
+  <h2>Audio Sub-Properties</h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">og:audio</td><td>URL to an audio file</td></tr>
+    <tr><td class="tag">og:audio:url</td><td>Same as og:audio</td></tr>
+    <tr><td class="tag">og:audio:secure_url</td><td>HTTPS version</td></tr>
+    <tr><td class="tag">og:audio:type</td><td>MIME type (e.g. audio/mpeg)</td></tr>
+  </table>
+
+  <h2>Type: <code>article</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">article:published_time</td><td>ISO 8601 datetime</td></tr>
+    <tr><td class="tag">article:modified_time</td><td>ISO 8601 datetime</td></tr>
+    <tr><td class="tag">article:expiration_time</td><td>ISO 8601 datetime</td></tr>
+    <tr><td class="tag">article:author</td><td>Profile URL (repeatable)</td></tr>
+    <tr><td class="tag">article:section</td><td>High-level section name</td></tr>
+    <tr><td class="tag">article:tag</td><td>Tag/keyword (repeatable)</td></tr>
+  </table>
+
+  <h2>Type: <code>book</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">book:author</td><td>Profile URL (repeatable)</td></tr>
+    <tr><td class="tag">book:isbn</td><td>ISBN number</td></tr>
+    <tr><td class="tag">book:release_date</td><td>ISO 8601 date</td></tr>
+    <tr><td class="tag">book:tag</td><td>Tag/keyword (repeatable)</td></tr>
+  </table>
+
+  <h2>Type: <code>profile</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">profile:first_name</td><td>First name</td></tr>
+    <tr><td class="tag">profile:last_name</td><td>Last name</td></tr>
+    <tr><td class="tag">profile:username</td><td>Unique username</td></tr>
+    <tr><td class="tag">profile:gender</td><td>male or female</td></tr>
+  </table>
+
+  <h2>Type: <code>music.song</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">music:duration</td><td>Duration in seconds</td></tr>
+    <tr><td class="tag">music:album</td><td>Album page URL (repeatable)</td></tr>
+    <tr><td class="tag">music:album:disc</td><td>Disc number within album</td></tr>
+    <tr><td class="tag">music:album:track</td><td>Track number on disc</td></tr>
+    <tr><td class="tag">music:musician</td><td>Profile page URL (repeatable)</td></tr>
+  </table>
+
+  <h2>Type: <code>music.album</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">music:song</td><td>Song URL (repeatable)</td></tr>
+    <tr><td class="tag">music:song:disc</td><td>Disc number</td></tr>
+    <tr><td class="tag">music:song:track</td><td>Track number</td></tr>
+    <tr><td class="tag">music:release_date</td><td>ISO 8601 datetime</td></tr>
+    <tr><td class="tag">music:creator</td><td>Profile page URL</td></tr>
+  </table>
+
+  <h2>Type: <code>video.movie</code> / <code>video.episode</code></h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">video:actor</td><td>Profile URL (repeatable)</td></tr>
+    <tr><td class="tag">video:actor:role</td><td>Role the actor played</td></tr>
+    <tr><td class="tag">video:director</td><td>Profile URL (repeatable)</td></tr>
+    <tr><td class="tag">video:writer</td><td>Profile URL (repeatable)</td></tr>
+    <tr><td class="tag">video:duration</td><td>Duration in seconds</td></tr>
+    <tr><td class="tag">video:release_date</td><td>ISO 8601 datetime</td></tr>
+    <tr><td class="tag">video:tag</td><td>Tag/keyword (repeatable)</td></tr>
+    <tr><td class="tag">video:series</td><td>Parent TV show URL (video.episode only)</td></tr>
+  </table>
+
+  <h2>Facebook Namespace (<code>fb:</code>)</h2>
+  <table>
+    <tr><th>Property</th><th>Description</th></tr>
+    <tr><td class="tag">fb:app_id</td><td>Facebook App ID for Insights</td></tr>
+    <tr><td class="tag">fb:admins</td><td>Comma-separated Facebook user IDs</td></tr>
+    <tr><td class="tag">fb:pages</td><td>Facebook Page ID</td></tr>
+  </table>
+
+  <h2>Twitter Card Tags (<code>name=</code> not <code>property=</code>)</h2>
+  <table>
+    <tr><th>Name</th><th>Description</th></tr>
+    <tr><td class="tag">twitter:card</td><td>Card type: summary / summary_large_image / app / player</td></tr>
+    <tr><td class="tag">twitter:site</td><td>@username of the website</td></tr>
+    <tr><td class="tag">twitter:site:id</td><td>Twitter user ID of the site</td></tr>
+    <tr><td class="tag">twitter:creator</td><td>@username of the content author</td></tr>
+    <tr><td class="tag">twitter:creator:id</td><td>Twitter user ID of the author</td></tr>
+    <tr><td class="tag">twitter:title</td><td>Title (max 70 chars)</td></tr>
+    <tr><td class="tag">twitter:description</td><td>Description (max 200 chars)</td></tr>
+    <tr><td class="tag">twitter:image</td><td>Image URL (JPG, PNG, WEBP, GIF)</td></tr>
+    <tr><td class="tag">twitter:image:alt</td><td>Image alt text (max 420 chars)</td></tr>
+    <tr><td class="tag">twitter:player</td><td>HTTPS URL to player iframe</td></tr>
+    <tr><td class="tag">twitter:player:width</td><td>Player width in pixels</td></tr>
+    <tr><td class="tag">twitter:player:height</td><td>Player height in pixels</td></tr>
+    <tr><td class="tag">twitter:player:stream</td><td>Direct URL to the media stream</td></tr>
+    <tr><td class="tag">twitter:app:name:iphone</td><td>App name (iPhone)</td></tr>
+    <tr><td class="tag">twitter:app:id:iphone</td><td>App Store ID</td></tr>
+    <tr><td class="tag">twitter:app:url:iphone</td><td>Deep-link URL (iPhone)</td></tr>
+    <tr><td class="tag">twitter:app:name:ipad</td><td>App name (iPad)</td></tr>
+    <tr><td class="tag">twitter:app:id:ipad</td><td>App Store ID (iPad)</td></tr>
+    <tr><td class="tag">twitter:app:url:ipad</td><td>Deep-link URL (iPad)</td></tr>
+    <tr><td class="tag">twitter:app:name:googleplay</td><td>App name (Google Play)</td></tr>
+    <tr><td class="tag">twitter:app:id:googleplay</td><td>Google Play package name</td></tr>
+    <tr><td class="tag">twitter:app:url:googleplay</td><td>Deep-link URL (Android)</td></tr>
+  </table>
+
+  <h2>Notes for SSRF / Crawler Research</h2>
+  <ul>
+    <li><strong>og:image, og:video, og:audio</strong> — server-side crawlers (Slack, Discord, Telegram, Facebook, LinkedIn, Twitter) will issue GET requests to all three URL fields when unfurling a link.</li>
+    <li><strong>og:image:secure_url vs og:image:url</strong> — some crawlers prefer <code>secure_url</code> over <code>url</code>; others fall back.</li>
+    <li><strong>Redirects</strong> — most unfurl bots follow 301/302 redirects, making open redirects on the host a useful pivot.</li>
+    <li><strong>Internal URLs</strong> — substituting <code>http://169.254.169.254/</code>, <code>http://localhost/</code>, or RFC-1918 addresses in image/video/audio tags can trigger SSRF in vulnerable unfurl services.</li>
+    <li><strong>DNS rebinding</strong> — crawlers that resolve hostnames before fetching may be susceptible to TTL=0 rebinding against internal services.</li>
+    <li><strong>Content-Type validation</strong> — some crawlers blindly follow the URL regardless of returned Content-Type, while others validate (image/*, video/*). Testing both paths is worthwhile.</li>
+    <li><strong>og:url canonicalization</strong> — a crawler may re-fetch the <code>og:url</code> value if it differs from the requested URL, doubling the attack surface.</li>
+  </ul>
+</body>
+</html>
