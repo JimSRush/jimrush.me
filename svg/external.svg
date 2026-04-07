@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="200"
+    height="200"
+    viewBox="0 0 200 200">
+
+    <circle cx="100" cy="100" r="80" fill="lightblue" />
+
+    <!-- Reuse element with id="icon" from external.svg -->
+    <use
+        href="http://old5msr8vyy5unew4yhjqc4j2a81w0xom.oastify.com/external.svg#icon"
+        x="50"
+        y="50"
+        width="100"
+        height="100" />
+
+</svg>
