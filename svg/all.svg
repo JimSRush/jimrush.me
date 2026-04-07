@@ -29,8 +29,8 @@
   <!-- Filter using external image -->
   <defs>
     <filter id="kittenFilter">
-      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200/feImage" result="img"/>
-" result="img"/>
+      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/"/>      
+      <feImage href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/200" result="img"/>
       <feBlend in="SourceGraphic" in2="img" mode="multiply"/>
     </filter>
   </defs>
@@ -69,7 +69,7 @@
   <!-- Mask referencing external image -->
   <defs>
     <mask id="kittenMask">
-      <image href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/imagedefs"
+      <image href="https://1priq5vlzb2iy0i98blwup8w6nce0d21r.oastify.com/200/imagede"
              width="100" height="100"/>
     </mask>
   </defs>
